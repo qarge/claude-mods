@@ -6,7 +6,7 @@ Mods for [Claude Code](https://code.claude.com): plugins that change what Claude
 
 | Mod | What it does | License |
 | --- | --- | --- |
-| [`token-weather`](mods/token-weather/) | A live forecast above the prompt: context window fill (cached and uncached) updated on every model request, the draft prompt's tokens as you type, and the 5-hour and weekly usage limits as `/usage` reports them. | Apache-2.0, derived from Anthropic's [claude-code-playground](https://github.com/anthropics/claude-code-playground) |
+| [`token-weather`](mods/token-weather/) | A live forecast above the prompt: context window fill (cached and uncached) updated on every model request, and the 5-hour and weekly usage limits as `/usage` reports them. | Apache-2.0, derived from Anthropic's [claude-code-playground](https://github.com/anthropics/claude-code-playground) |
 
 ## Install
 

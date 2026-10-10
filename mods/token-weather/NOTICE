@@ -37,8 +37,17 @@ Changes by qarge, 2026-10-10 (version 0.3.0):
   - after /compact, an estimate from the messages compacted and their
     replacement (session.compact), in place of the old size;
   - the draft in the prompt box, pastes included, counted with the API's
-    token counter, and the size of the next request;
+    token counter, and the size of the next request (removed in 0.4.0);
   - every icon outside the emoji block carries U+FE0F.
+- README.md and the tests describe and cover the above.
+
+Changes by qarge, 2026-10-10 (version 0.4.0):
+
+- hooks/token-weather.tsx:
+  - the draft count was removed;
+  - the context figures are kept with the session id they were measured
+    in: /clear and /resume drop them (session.end), a draw for another
+    chat shows none, and the next chat's own figures are read.
 - README.md and the tests describe and cover the above.
 
 Every file in this folder is under the Apache License, Version 2.0 (see

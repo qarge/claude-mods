@@ -35,10 +35,8 @@ type World = {
   usage?: () => SessionUsage
   authorize?: () => { handle: string; kind: 'bearer' | 'api-key' } | null
   fetch?: () => HttpResponse
-  draft?: () => string
-  clipboard?: () => string
+  id?: () => string
   messages?: () => unknown[]
-  canCount?: boolean
 }
 
 const COUNT_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
@@ -76,16 +74,14 @@ function world(on: On, w: World = {}) {
   on('http.fetch', (_$, e) => {
     fetches.push(e.url)
     if (e.url === COUNT_URL) {
-      if (w.canCount === false) throw new Error('offline')
       return { value: counter(e.init?.body) }
     }
     return { value: w.fetch ? w.fetch() : ok(USAGE_BODY) }
   })
   on('session.model', () => ({ value: 'claude-test' }))
-  on('prompt.read', () => ({ value: { text: w.draft?.() ?? '', cursor: 0 } }))
+  on('session.id', () => ({ value: w.id?.() ?? 'chat' }))
   on('session.messages', () => ({ value: (w.messages?.() ?? []) as never }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: w.clipboard?.() ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
-  return { clock, fetches, counts: () => fetches.filter(u => u === COUNT_URL).length }
+  return { clock, fetches }
 }
 
 async function start($: Engine, clock: MockClock) {
@@ -361,7 +357,7 @@ describe('context', () => {
     expect((await rows(ui)).context).toContain('50k / 200k · 49.5k cached')
   })
 
-  test('when the engine lets go of its figure (/clear), the row falls back to the estimate', async ($, on) => {
+  test('a rewind or the end of a compaction: when the engine lets go of its figure, so does the row', async ($, on) => {
     let tokens: number | undefined = 30_000
     const { clock } = world(on, {
       usage: () =>
@@ -375,45 +371,75 @@ describe('context', () => {
     expect((await rows(ui)).context).toContain('~12k / 200k estimated')
   })
 
-  test('counts the draft as it is typed, pastes included, and adds it to the next request', async ($, on) => {
-    let draft = ''
-    let clipboard = ''
-    const { clock, counts } = world(on, { draft: () => draft, clipboard: () => clipboard })
+  test('another chat (/clear, /resume) never shows the last chat’s figures', async ($, on) => {
+    let chat = 'A'
+    const engine: Record<string, number | undefined> = { A: undefined, B: 61_000, C: undefined }
+    const { clock } = world(on, {
+      id: () => chat,
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engine[chat], breakdown: { autoCompactThreshold: 160_000, totalTokens: chat === 'C' ? 41_000 : 40_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      const u = usage(18_000, 24_100)
+      yield { kind: 'stop', stopReason: 'end_turn', usage: u }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: u }
+    })
     await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 1 })
+    engine.A = 42_100
     const ui = await $.ui.mount(band())
-    draft = 'hello world'
-    await clock.advance(500)
-    // 11 characters, 11 tokens in the test's counter; 40k context.
-    expect((await rows(ui)).context).toContain('~40k / 200k estimated · draft 11 → next ~40k')
+    expect((await rows(ui)).context).toContain('42.1k / 200k · 24.1k cached · 18k uncached')
 
-    // A paste Claude Code shows as a placeholder: the clipboard holds it.
-    clipboard = 'p'.repeat(2_000) + '\n' + 'q'.repeat(999)
-    draft = 'look: [Pasted text #1 +1 lines]'
+    // /resume B: A ends first, and the engine keeps A's id for a moment.
+    const end = (reason: string) => $.session.end({ reason, sessionId: chat, resume: { id: chat } } as never)
+    await end('resume')
+    let r = (await rows(ui)).context
+    expect(r).toContain('estimating…')
+    expect(r).not.toMatch(/42\.1k|cached/)
     await clock.advance(500)
-    const shown = (await rows(ui)).context
-    expect(shown).toContain('draft 3k → next ~43k') // 'look: ' and the 3,000 pasted
-    const used = counts()
-    draft = 'look at this: [Pasted text #1 +1 lines]'
+    expect((await rows(ui)).context).toContain('estimating…')
+    chat = 'B'
+    // Then B's own last figure, as the engine has it from its transcript. The
+    // split comes with B's next response.
     await clock.advance(500)
-    expect(counts() - used).toBe(1) // only the typed text again; the paste was counted once
+    r = (await rows(ui)).context
+    expect(r).toContain('61k / 200k · 99k to auto-compact')
+    expect(r).not.toContain('cached')
 
-    // A clipboard that no longer matches the placeholder is not guessed at.
-    clipboard = 'something else'
-    draft = 'and [Pasted text #1 +1 lines] [Pasted text #2 +40 lines] [Image #1]'
+    // /clear: a new, empty chat has only the estimate.
+    await end('clear')
+    expect((await rows(ui)).context).toContain('estimating…')
+    chat = 'C'
     await clock.advance(500)
-    expect((await rows(ui)).context).toContain('draft ≥3k (2 uncounted)') // #1 as read when it was pasted
-
-    // Commands are not sent as typed.
-    draft = '/compact'
-    await clock.advance(500)
-    expect((await rows(ui)).context).not.toContain('draft')
+    r = (await rows(ui)).context
+    expect(r).toContain('~41k / 200k estimated')
+    expect(r).not.toContain('cached')
+    // Its first response is its own.
+    await step($, { turnId: 't2', index: 0, model: 'claude-test', messageCount: 1 })
+    expect((await rows(ui)).context).toContain('42.1k / 200k · 24.1k cached · 18k uncached')
   })
 
-  test('without the token counter the draft is estimated, and says so', async ($, on) => {
-    const { clock } = world(on, { draft: () => 'x'.repeat(400), canCount: false })
+  test('a compaction that ends after a switch leaves the new chat alone', async ($, on) => {
+    let chat = 'A'
+    let compacted = false
+    const { clock } = world(on, {
+      id: () => chat,
+      messages: () => [{ role: 'user', content: [{ type: 'text', text: compacted ? 'short' : 'x'.repeat(30_000) }] }],
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, breakdown: { autoCompactThreshold: 160_000, totalTokens: 41_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
     await start($, clock)
-    await clock.advance(500)
-    expect((await rows(await $.ui.mount(band()))).context).toContain('draft ~100')
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    chat = 'B'
+    compacted = true
+    await clock.advance(2_000)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('~41k / 200k estimated')
   })
 })
 

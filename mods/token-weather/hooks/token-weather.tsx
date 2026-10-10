@@ -14,8 +14,9 @@
 // usage the moment it finishes (cached and uncached input), so the band moves
 // with every request of a turn. Where no response has said it yet (a fresh
 // session, after /compact or /clear) the row shows an estimate, marked `~`.
-// The draft in the prompt box is counted with the API's token counter as it
-// is typed, and added to what the next request will carry.
+// The figures belong to one chat: /clear and /resume switch chats inside the
+// process without a session.start, so they are kept with the session id they
+// were measured in, and never drawn for another.
 //
 // Limits, exact: GET /api/oauth/usage, the endpoint /usage reads, sent with
 // the session's credential handle ($.session.authorize: the token itself
@@ -32,14 +33,11 @@ import type { ApiMessage, EngineInterface, Register, SessionContextUsage, Sessio
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const COUNT_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
 const TICK_MS = 30_000 // countdowns redraw, and stale limits are refetched
-const WATCH_MS = 500 // the draft and the engine's context figure are read this often
+const WATCH_MS = 500 // the session id and the engine's context figure are read this often
 const MIN_FETCH_MS = 30_000 // at most one /usage read this often
 const REFRESH_MS = 5 * 60_000 // limits heard of longer ago than this are fetched again
 const STALE_MS = 15 * 60_000 // past this a limit row says how old it is
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
-// Claude Code shows a long paste as this placeholder and keeps the text aside.
-const PASTE = /\[Pasted text #(\d+)(?: \+(\d+) lines?)?\]/g
-const IMAGE = /\[Image #\d+\]/g
 
 // One scale for the context window and both limits, by percent used. Each
 // icon carries U+FE0F, which asks for the emoji glyph: a coding font with its
@@ -61,6 +59,8 @@ type Limit = { used: number; resetsAt?: number; at: number }
 
 // The session's readings. Module state: a reload runs session.start again,
 // which reads everything afresh.
+let session: string | undefined // the chat the context figures below belong to
+let ended: string | undefined // a chat /clear or /resume has left, until the next one is in
 let ctx: {
   window?: number
   compactAt?: number
@@ -71,11 +71,6 @@ let ctx: {
   estimate?: number // when no response has measured the context yet
   stale?: number // the engine's figure from before a compaction, until it lets go of it
 } = {}
-let draft: { text: string; tokens?: number; isEstimate?: boolean; missing?: number } = { text: '' }
-let pastes = new Map<string, string | null>() // placeholder id → the pasted text, null when unreadable
-let counted = new Map<string, number>() // text → its tokens, as counted
-let overhead: number | undefined // what count_tokens adds around one message
-let isCounting = false
 let limits: Record<string, Limit> = {}
 let limitsNote: string | undefined // why a limit row is empty, when it is
 let fetchedAt = -Infinity
@@ -88,9 +83,8 @@ let watcher: Timer | undefined
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    session = await $.session.id()
     ctx = {}
-    draft = { text: '' }
-    pastes = new Map()
     limits = {}
     limitsNote = undefined
     fetchedAt = -Infinity
@@ -104,6 +98,18 @@ export const register: Register = on => {
     // The first /usage read, off the startup path.
     $.clock.after(0, () => void fetchLimits($))
     return result
+  })
+
+  // /clear and /resume end the chat before the next one takes its id: from
+  // here nothing of this one is drawn, and the watch waits for the new id.
+  on('session.end', ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      ended = e.sessionId
+      session = undefined
+      ctx = { window: ctx.window, compactAt: ctx.compactAt }
+      $.ui.invalidate('ui.render')
+    }
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -124,6 +130,7 @@ export const register: Register = on => {
       // A subagent's window is its own; this is the main conversation's.
       const cached = usage.cache_read_input_tokens ?? 0
       const uncached = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+      session = await $.session.id()
       ctx = { window: ctx.window, compactAt: ctx.compactAt, tokens: cached + uncached, cached, uncached, output: usage.output_tokens ?? 0 }
       $.ui.invalidate('ui.render')
     }
@@ -145,7 +152,7 @@ export const register: Register = on => {
     if (result.skip === undefined) {
       ctx = { window: ctx.window, compactAt: ctx.compactAt, stale: ctx.tokens }
       $.ui.invalidate('ui.render')
-      void estimateCompacted($, before, exact, beforeTokens)
+      void estimateCompacted($, session, before, exact, beforeTokens)
     }
     return result
   })
@@ -165,7 +172,8 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const columns = e.props.bodyColumns
     const rows = [
-      contextRow(),
+      // Until the watch has read the chat on screen, nothing of another shows.
+      contextRow((await $.session.id()) === session),
       limitRow('5-hour', limits.five_hour, now, columns, false),
       limitRow('Weekly', limits.seven_day, now, columns, true),
     ]
@@ -219,30 +227,35 @@ async function readUsage($: EngineInterface) {
   }
 }
 
-// Every WATCH_MS: the draft, and whether the engine has let go of the context
-// figure (/clear, a rewind, the end of a compaction).
+// Every WATCH_MS: whether another chat is on screen (/clear, /resume), and
+// whether the engine has let go of the context figure (a compaction settled,
+// a rewind). Either way the chat's own figures are read afresh: the engine's
+// exact one for a resumed chat, else its estimate.
 async function watch($: EngineInterface) {
   try {
+    const id = await $.session.id()
+    if (id === ended) {
+      return // the chat that ended is still the engine's for a moment
+    }
     const { context } = await $.session.usage()
-    if (context.tokens === undefined && ctx.stale !== undefined) {
+    if (id !== session) {
+      session = id
+      ended = undefined
+    } else if (context.tokens === undefined && ctx.stale !== undefined) {
       ctx.stale = undefined // the compaction has settled
-    } else if (context.tokens === undefined && ctx.tokens !== undefined) {
-      ctx = { window: ctx.window, compactAt: ctx.compactAt }
-      $.ui.invalidate('ui.render')
-      await readUsage($)
+      return
+    } else if (context.tokens !== undefined || ctx.tokens === undefined) {
+      return
     }
-    const { text } = await $.prompt.read()
-    if (text !== draft.text) {
-      draft = { ...draft, text } // the last count shows until this one is in
-      $.ui.invalidate('ui.render')
-      await countDraft($)
-    }
+    ctx = { window: ctx.window, compactAt: ctx.compactAt }
+    await readUsage($)
+    $.ui.invalidate('ui.render')
   } catch {
     // Read again on the next round.
   }
 }
 
-async function estimateCompacted($: EngineInterface, before: readonly ApiMessage[], exact: number | undefined, beforeTokens: Promise<number | undefined> | undefined) {
+async function estimateCompacted($: EngineInterface, chat: string | undefined, before: readonly ApiMessage[], exact: number | undefined, beforeTokens: Promise<number | undefined> | undefined) {
   // The conversation the engine reads back changes a moment after the hook.
   let after = before
   for (let i = 0; i < 20 && sameStart(after, before); i++) {
@@ -251,8 +264,8 @@ async function estimateCompacted($: EngineInterface, before: readonly ApiMessage
   }
   const was = exact === undefined ? undefined : await beforeTokens
   const now = was === undefined ? undefined : await countTokens($, after)
-  if (ctx.tokens !== undefined) {
-    return // a response has measured it meanwhile
+  if (ctx.tokens !== undefined || session !== chat) {
+    return // a response has measured it meanwhile, or another chat is on screen
   }
   if (exact !== undefined && was !== undefined && now !== undefined) {
     ctx.estimate = Math.max(0, exact - was + now)
@@ -264,82 +277,6 @@ async function estimateCompacted($: EngineInterface, before: readonly ApiMessage
 
 function sameStart(a: readonly ApiMessage[], b: readonly ApiMessage[]) {
   return a.length === b.length && JSON.stringify(a[0]) === JSON.stringify(b[0])
-}
-
-// The draft's tokens: the typed text and each paste counted apart (a paste
-// once), less what the counter adds around a message. Commands and shell
-// lines (`/`, `!`) are not sent to the model as typed and are not counted.
-async function countDraft($: EngineInterface) {
-  if (isCounting) {
-    return // the running count looks again when it ends
-  }
-  isCounting = true
-  try {
-    for (let text = ''; text !== draft.text; ) {
-      text = draft.text
-      const result = /^\s*([/!]|$)/.test(text) ? {} : await draftTokens($, text)
-      if (text === draft.text) {
-        draft = { text, ...result }
-        $.ui.invalidate('ui.render')
-      }
-    }
-  } finally {
-    isCounting = false
-  }
-}
-
-async function draftTokens($: EngineInterface, text: string) {
-  const pieces = [text.replace(PASTE, '').replace(IMAGE, '')]
-  let missing = (text.match(IMAGE) ?? []).length
-  for (const [, id, lines] of text.matchAll(PASTE)) {
-    if (!pastes.has(id!)) {
-      pastes.set(id!, await readPaste($, lines === undefined ? undefined : Number(lines)))
-    }
-    const pasted = pastes.get(id!)
-    if (pasted) {
-      pieces.push(pasted)
-    } else {
-      missing += 1
-    }
-  }
-  let tokens = 0
-  let isEstimate = false
-  for (const piece of pieces.filter(p => p.trim())) {
-    let n = counted.get(piece)
-    if (n === undefined) {
-      const total = await countTokens($, [{ role: 'user', content: [{ type: 'text', text: piece }] }])
-      overhead ??= total === undefined ? undefined : await messageOverhead($)
-      if (total !== undefined && overhead !== undefined) {
-        n = Math.max(0, total - overhead)
-        if (counted.size > 100) counted.clear() // ponytail: each typed prefix is a key; a bounded LRU if it matters
-        counted.set(piece, n)
-      }
-    }
-    if (n === undefined) {
-      n = Math.ceil(piece.length / 4) // ponytail: rough chars/4 when the counter can't be reached
-      isEstimate = true
-    }
-    tokens += n
-  }
-  return { tokens, isEstimate, missing }
-}
-
-// The text of a paste Claude Code shows as a placeholder: the clipboard, if it
-// still holds a text of the placeholder's line count (macOS, pbpaste).
-async function readPaste($: EngineInterface, lines: number | undefined) {
-  try {
-    const { exitCode, stdout, isStdoutTruncated } = await $.process.run(['pbpaste'], { timeoutMs: 2000 })
-    const newlines = (stdout.match(/\n/g) ?? []).length
-    const isMatch = lines === undefined ? newlines === 0 : Math.abs(newlines - lines) <= 1
-    return exitCode === 0 && !isStdoutTruncated && stdout && isMatch ? stdout : null
-  } catch {
-    return null
-  }
-}
-
-async function messageOverhead($: EngineInterface) {
-  const one = await countTokens($, [{ role: 'user', content: [{ type: 'text', text: 'a' }] }])
-  return one === undefined ? undefined : one - 1
 }
 
 // The API's token counter (POST /v1/messages/count_tokens), for the session's
@@ -453,20 +390,15 @@ type Row = {
   shortDetail?: string
 }
 
-function contextRow(): Row {
+function contextRow(isOwn: boolean): Row {
   const window = ctx.window ?? 0
-  const isExact = ctx.tokens !== undefined
-  const tokens = ctx.tokens ?? ctx.estimate
-  const parts: string[] = []
-  const draftPart = draftDetail(tokens)
+  const isExact = isOwn && ctx.tokens !== undefined
+  const tokens = isOwn ? (ctx.tokens ?? ctx.estimate) : undefined
   if (tokens === undefined) {
-    parts.push(`of ${short(window)} · estimating…`)
-    if (draftPart) parts.push(draftPart)
-    return { label: 'Context', short: 'ctx', sky: WAITING, ratio: 0, percent: '—', detail: parts.join(' · ') }
+    return { label: 'Context', short: 'ctx', sky: WAITING, ratio: 0, percent: '—', detail: `of ${short(window)} · estimating…` }
   }
   const mark = isExact ? '' : '~'
-  parts.push(`${mark}${short(tokens)} / ${short(window)}${isExact ? '' : ' estimated'}`)
-  if (draftPart) parts.push(draftPart)
+  const parts = [`${mark}${short(tokens)} / ${short(window)}${isExact ? '' : ' estimated'}`]
   if (ctx.cached !== undefined && ctx.uncached !== undefined) {
     parts.push(`${short(ctx.cached)} cached · ${short(ctx.uncached)} uncached`)
   }
@@ -480,30 +412,7 @@ function contextRow(): Row {
     ratio: tokens / window,
     percent: `${mark}${Math.round((tokens / window) * 100)}%`,
     detail: parts.join(' · '),
-    shortDetail: draft.tokens ? ` +${short(draft.tokens)}` : undefined,
   }
-}
-
-// The draft's tokens and what the next request will be answered over: the
-// context, the last reply (it joins the conversation) and the draft. Always
-// `~`: the engine adds reminders of its own to what it sends.
-function draftDetail(context: number | undefined) {
-  if (/^\s*([/!]|$)/.test(draft.text)) {
-    return undefined
-  }
-  if (draft.tokens === undefined) {
-    return 'draft counting…'
-  }
-  const isLow = (draft.missing ?? 0) > 0
-  const mark = isLow ? '≥' : draft.isEstimate ? '~' : ''
-  let text = `draft ${mark}${short(draft.tokens)}`
-  if (isLow) {
-    text += ` (${draft.missing} uncounted)`
-  }
-  if (context !== undefined) {
-    text += ` → next ${isLow ? '≥' : '~'}${short(context + (ctx.output ?? 0) + draft.tokens)}`
-  }
-  return text
 }
 
 function limitRow(label: string, limit: Limit | undefined, now: number, columns: number, isWeekly: boolean): Row {
