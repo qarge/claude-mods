@@ -1,0 +1,32 @@
+Token Weather
+Copyright 2026 Anthropic PBC
+Modifications copyright 2026 qarge
+
+This mod is derived from Token Weather by Anthropic's Claude Code DevRel
+team, published in https://github.com/anthropics/claude-code-playground
+(folder claude-code/mods/token-weather, commit e9ab132) under the Apache
+License, Version 2.0. That repository describes its entries as "not an
+official Anthropic product". This modified version is not made or endorsed
+by Anthropic. The original files are in this repository's first commit,
+"Import Token Weather 0.1.0 from anthropics/claude-code-playground".
+
+Changes by qarge, 2026-10-10 (version 0.2.0):
+
+- hooks/token-weather.mjs was rewritten as hooks/token-weather.tsx:
+  - the context row updates on every model request of a turn (turn.step),
+    not once per turn (turn.complete);
+  - new 5-hour and weekly usage limit rows, read from the endpoint /usage
+    reads, with the session's own credential, and from the rate-limit
+    readings Claude Code pushes during a turn (session.measure);
+  - one emoji scale for all rows, progress bars, remaining capacity, the
+    distance to auto-compaction, and reset countdowns;
+  - fixed reading e.hasSurvey and e.bodyColumns, which live under e.props.
+- hooks/hooks.json names the new module.
+- .claude-plugin/plugin.json: version 0.2.0, a new description, author,
+  license and homepage.
+- README.md was adapted from the original's to describe this version.
+- tests/token-weather.test.ts and tsconfig.json are new.
+- The screenshots of version 0.1.0 were removed.
+
+Every file in this folder is under the Apache License, Version 2.0 (see
+LICENSE), including the files qarge wrote for it.

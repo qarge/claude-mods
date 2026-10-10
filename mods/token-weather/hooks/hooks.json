@@ -1,5 +1,5 @@
 {
   "modules": [
-    "./token-weather.mjs"
+    "./token-weather.tsx"
   ]
 }

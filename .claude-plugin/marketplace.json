@@ -10,7 +10,7 @@
     {
       "name": "token-weather",
       "source": "./mods/token-weather",
-      "description": "A live forecast above the prompt: context window fill and the 5-hour and weekly usage limits."
+      "description": "A live forecast above the prompt: context window fill on every model request, and the 5-hour and weekly usage limits as /usage reports them."
     }
   ]
 }
