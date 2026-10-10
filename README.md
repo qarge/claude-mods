@@ -17,7 +17,7 @@ claude plugin marketplace add qarge/claude-mods
 claude plugin install token-weather@qarge-mods --scope user
 ```
 
-Or inside Claude Code: `/plugin marketplace add qarge/claude-mods`, then `/plugin install token-weather@qarge-mods`. The user scope loads a mod in every session from then on. To update an installed mod: `claude plugin marketplace update qarge-mods`, then `claude plugin update token-weather@qarge-mods`.
+Or inside Claude Code: `/plugin marketplace add qarge/claude-mods`, then `/plugin install token-weather@qarge-mods`. The user scope loads a mod in every session from then on. To update an installed mod: `claude plugin marketplace update qarge-mods`, then `claude plugin update token-weather@qarge-mods`, then restart Claude Code.
 
 The mods use Claude Code's mod API, which is early access and changes between releases. Each mod's README names the Claude Code version it was built and tested on.
 
@@ -48,14 +48,15 @@ claude --plugin-dir mods/<name>
 
 The session reloads the mod each time a file in it is saved, and lays the API's type declarations in `mods/<name>/.claude-plugin/types/` (ignored by git), which `tsconfig.json` uses. Those declarations are the API reference: every event, every call on `$`, and every UI element with its props. In Claude Code, the `plugin-authoring` skill covers writing mods.
 
-To run your working copy in every session instead of the published one, add the clone as the marketplace (in place of the GitHub one; both are named `qarge-mods`):
+To run your working copy in every session instead of the published one, use the clone as the marketplace in place of the GitHub one (both are named `qarge-mods`):
 
 ```bash
-claude plugin marketplace add ~/projects/claude-mods
+claude plugin marketplace remove qarge-mods
+claude plugin marketplace add /path/to/your/clone
 claude plugin install <name>@qarge-mods --scope user
 ```
 
-A marketplace added from a folder is read from that folder: after an edit, run `/reload-plugins` in a session.
+Claude Code runs an installed copy of the mod, not the folder: after a change, bump the mod's `version`, run `claude plugin update <name>@qarge-mods`, then restart Claude Code.
 
 ## Add a mod
 
@@ -75,7 +76,7 @@ A marketplace added from a folder is read from that folder: after an edit, run `
    scripts/check.sh my-mod     # one mod
    ```
 
-   For each mod it checks that the marketplace lists it, that `claude plugin validate` passes, that its tests pass, that it type-checks (once its API types are laid), and that every code file has an `SPDX-License-Identifier` line.
+   For each mod it checks that the marketplace lists it under the name in its `plugin.json`, that `claude plugin validate --strict` passes (warnings fail it too), that its tests pass, that it type-checks, and that every code file has an `SPDX-License-Identifier` line naming the mod's `license`. Type-checking needs the API types that `claude --plugin-dir mods/my-mod` lays; without them the check fails, and `SKIP_TSC=1 scripts/check.sh` skips it on purpose.
 5. Commit and push. Installed copies update by version, so bump `version` in the mod's `plugin.json` whenever its behavior changes.
 
 ## Maintain
