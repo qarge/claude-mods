@@ -50,5 +50,14 @@ Changes by qarge, 2026-10-10 (version 0.4.0):
     chat shows none, and the next chat's own figures are read.
 - README.md and the tests describe and cover the above.
 
+Changes by qarge, 2026-10-10 (version 0.4.1):
+
+- hooks/token-weather.tsx:
+  - the limits readings are kept in the plugin's store, and a session
+    starts on the last one, less any window that has reset since;
+  - the first /usage read starts alongside the engine's start;
+  - within one window the higher of the /usage and header figures stands.
+- README.md and the tests describe and cover the above.
+
 Every file in this folder is under the Apache License, Version 2.0 (see
 LICENSE), including the files qarge wrote for it.

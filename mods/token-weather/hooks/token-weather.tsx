@@ -23,7 +23,9 @@
 // never reaches this module). Fetched at start, after each turn (the headers
 // below are read as a request is answered, so they lag its own cost), and
 // whenever no reading is fresher than REFRESH_MS. While Claude works, every
-// response's rate-limit headers arrive through session.measure.
+// response's rate-limit headers arrive through session.measure. The fetch
+// takes about half a second, so a session starts on the last reading any
+// session kept ($.store), and the fetch runs alongside the engine's start.
 //
 // The host reads on(...) and $.noun.method(...) from source, so they are
 // spelled literally, and helpers that take $ are top-level functions.
@@ -37,6 +39,7 @@ const WATCH_MS = 500 // the session id and the engine's context figure are read 
 const MIN_FETCH_MS = 30_000 // at most one /usage read this often
 const REFRESH_MS = 5 * 60_000 // limits heard of longer ago than this are fetched again
 const STALE_MS = 15 * 60_000 // past this a limit row says how old it is
+const STORE_KEY = 'limits' // the last readings, across sessions
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 
 // One scale for the context window and both limits, by percent used. Each
@@ -82,21 +85,20 @@ let watcher: Timer | undefined
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    const result = await next(e)
-    session = await $.session.id()
-    ctx = {}
-    limits = {}
+    limits = saved(await $.store.get(STORE_KEY).catch(() => undefined), await $.clock.now())
     limitsNote = undefined
     fetchedAt = -Infinity
     retryAt = 0
     hasTurnEnded = false
+    void fetchLimits($) // not awaited: the engine starts meanwhile
+    const result = await next(e)
+    session = await $.session.id()
+    ctx = {}
     await readUsage($)
     ticker?.cancel()
     ticker = $.clock.every(TICK_MS, () => void tick($))
     watcher?.cancel()
     watcher = $.clock.every(WATCH_MS, () => void watch($))
-    // The first /usage read, off the startup path.
-    $.clock.after(0, () => void fetchLimits($))
     return result
   })
 
@@ -116,6 +118,9 @@ export const register: Register = on => {
     const isNewWindow = e.context.window !== ctx.window
     applyContext(e.context)
     applyLimits(e.rateLimits, await $.clock.now())
+    if (e.rateLimits.length > 0) {
+      keepLimits($)
+    }
     if (isNewWindow) {
       await readUsage($) // another model: its own compaction point
     }
@@ -330,6 +335,7 @@ async function fetchLimits($: EngineInterface) {
     const auth = await $.session.authorize()
     if (auth?.kind !== 'bearer') {
       // An API key, a gateway or a third-party provider: no plan limits.
+      limits = {}
       limitsNote = 'needs a claude.ai subscription login'
       retryAt = Infinity
       return
@@ -349,12 +355,13 @@ async function fetchLimits($: EngineInterface) {
     for (const kind of ['five_hour', 'seven_day']) {
       const window = (data as Record<string, { utilization?: unknown; resets_at?: unknown } | null>)?.[kind]
       if (typeof window?.utilization === 'number') {
-        limits[kind] = { used: window.utilization, resetsAt: timeOf(window.resets_at), at: now }
+        setLimit(kind, window.utilization, timeOf(window.resets_at), now)
         hasAny = true
       }
     }
     limitsNote = hasAny ? undefined : 'no 5-hour or weekly limit on this plan'
     retryAt = 0
+    keepLimits($)
   } catch {
     retryAt = now + 2 * 60_000
     limitsNote = '/usage could not be read'
@@ -376,8 +383,32 @@ function applyContext(context: SessionContextUsage) {
 
 function applyLimits(list: readonly SessionRateLimit[], now: number) {
   for (const limit of list) {
-    limits[limit.kind] = { used: limit.percentUsed, resetsAt: timeOf(limit.resetsAt), at: now }
+    setLimit(limit.kind, limit.percentUsed, timeOf(limit.resetsAt), now)
   }
+}
+
+// A window's use only grows until it resets. The headers' figure runs a point
+// under /usage's (78 to 79), so within one window the higher one stands.
+function setLimit(kind: string, used: number, resetsAt: number | undefined, now: number) {
+  const had = limits[kind]
+  const isSameWindow = had?.resetsAt !== undefined && resetsAt !== undefined && Math.abs(had.resetsAt - resetsAt) < 60_000
+  limits[kind] = { used: isSameWindow ? Math.max(had.used, used) : used, resetsAt, at: now }
+}
+
+// The readings for the next session's first frame, whichever session made them last.
+function keepLimits($: EngineInterface) {
+  $.store.set(STORE_KEY, limits).catch(() => {})
+}
+
+// A kept reading, less what can't stand: a window that has reset since.
+function saved(value: unknown, now: number) {
+  const kept: Record<string, Limit> = {}
+  for (const [kind, l] of Object.entries((value ?? {}) as Record<string, Partial<Limit> | null>)) {
+    if (typeof l?.used === 'number' && typeof l.at === 'number' && typeof l.resetsAt === 'number' && l.resetsAt > now) {
+      kept[kind] = { used: l.used, resetsAt: l.resetsAt, at: l.at }
+    }
+  }
+  return kept
 }
 
 type Row = {

@@ -34,8 +34,9 @@ function band(props: Partial<RenderPropsOf['AbovePrompt']> = {}, surface: 'termi
 type World = {
   usage?: () => SessionUsage
   authorize?: () => { handle: string; kind: 'bearer' | 'api-key' } | null
-  fetch?: () => HttpResponse
+  fetch?: () => HttpResponse | Promise<HttpResponse>
   id?: () => string
+  store?: Record<string, unknown>
   messages?: () => unknown[]
 }
 
@@ -55,6 +56,9 @@ function ok(body: unknown): HttpResponse {
 function world(on: On, w: World = {}) {
   const clock = mock.clock(on, { now: NOW })
   const fetches: string[] = []
+  const store: Record<string, unknown> = { ...w.store }
+  on('store.get', (_$, e) => ({ value: store[e.key] }))
+  on('store.set', (_$, e) => ((store[e.key] = e.value), { value: undefined }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
@@ -71,17 +75,17 @@ function world(on: On, w: World = {}) {
         } as unknown as SessionUsage),
   }))
   on('session.authorize', () => ({ value: w.authorize ? w.authorize() : { handle: 'handle', kind: 'bearer' } }))
-  on('http.fetch', (_$, e) => {
+  on('http.fetch', async (_$, e) => {
     fetches.push(e.url)
     if (e.url === COUNT_URL) {
       return { value: counter(e.init?.body) }
     }
-    return { value: w.fetch ? w.fetch() : ok(USAGE_BODY) }
+    return { value: w.fetch ? await w.fetch() : ok(USAGE_BODY) }
   })
   on('session.model', () => ({ value: 'claude-test' }))
   on('session.id', () => ({ value: w.id?.() ?? 'chat' }))
   on('session.messages', () => ({ value: (w.messages?.() ?? []) as never }))
-  return { clock, fetches }
+  return { clock, fetches, store }
 }
 
 async function start($: Engine, clock: MockClock) {
@@ -129,6 +133,77 @@ describe('limits', () => {
       expect(r.context).toContain('~40k / 200k estimated')
       await ui.unmount()
     }
+  })
+
+  test('the last reading any session made shows from the first frame, until /usage answers', async ($, on) => {
+    let answer: (r: HttpResponse) => void = () => {}
+    const { clock, store } = world(on, {
+      fetch: () => new Promise<HttpResponse>(resolve => (answer = resolve)),
+      store: {
+        limits: {
+          five_hour: { used: 7, resetsAt: NOW + 2 * HOUR + 14 * MINUTE, at: NOW - 10 * MINUTE },
+          seven_day: { used: 66, resetsAt: NOW + 44 * HOUR + 5 * MINUTE, at: NOW - 10 * MINUTE },
+        },
+      },
+    })
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount(band())
+    let r = await rows(ui)
+    expect(r.fiveHour).toContain('7%  93% left · resets in 2h 14m')
+    expect(r.weekly).toContain('66%  34% left')
+    expect(r.context).toContain('~40k / 200k estimated')
+    answer(ok(USAGE_BODY))
+    await clock.settle()
+    r = await rows(ui)
+    expect(r.fiveHour).toContain('8%  92% left · resets in 2h 13m')
+    // What /usage said is kept for the next session.
+    expect(JSON.parse(JSON.stringify(store.limits))).toMatchObject({ five_hour: { used: 8, at: NOW }, seven_day: { used: 66.4, at: NOW } })
+  })
+
+  test('a saved reading says how old it is, and one whose window has reset since is not shown', async ($, on) => {
+    const { clock } = world(on, {
+      fetch: () => new Promise<HttpResponse>(() => {}),
+      store: {
+        limits: {
+          five_hour: { used: 97, resetsAt: NOW - MINUTE, at: NOW - 3 * HOUR },
+          seven_day: { used: 66, resetsAt: NOW + 44 * HOUR, at: NOW - 3 * HOUR },
+          junk: { used: 'x' },
+        },
+      },
+    })
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    void clock
+    const r = await rows(await $.ui.mount(band()))
+    expect(r.fiveHour).toContain('reading /usage…')
+    expect(r.weekly).toContain('66%  34% left · resets in 1d 20h (')
+    expect(r.weekly).toContain('as of 3h 0m ago')
+  })
+
+  test('a saved subscription reading is not shown under an API key', async ($, on) => {
+    const { clock } = world(on, {
+      authorize: () => ({ handle: 'key', kind: 'api-key' }),
+      store: { limits: { seven_day: { used: 66, resetsAt: NOW + HOUR, at: NOW } } },
+    })
+    await start($, clock)
+    const r = await rows(await $.ui.mount(band()))
+    expect(r.weekly).toContain('unavailable: needs a claude.ai subscription login')
+  })
+
+  test('a rate-limit header never pulls back the /usage figure of the same window', async ($, on) => {
+    const { clock } = world(on)
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    const header = (percentUsed: number) =>
+      $.session.measure({
+        context: { window: 200_000 },
+        // The same reset as /usage gave, spelled to the millisecond.
+        rateLimits: [{ kind: 'seven_day', percentUsed, resetsAt: new Date(Date.parse(USAGE_BODY.seven_day.resets_at) + 158).toISOString() }],
+        changed: ['rateLimits'],
+      })
+    await header(65)
+    expect((await rows(ui)).weekly).toContain('66%  34% left')
+    await header(67.5)
+    expect((await rows(ui)).weekly).toContain('67%  33% left')
   })
 
   test('rate-limit headers pushed by session.measure replace the fetched figures', async ($, on) => {
