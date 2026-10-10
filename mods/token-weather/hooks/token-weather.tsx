@@ -10,10 +10,12 @@
 // limits, drawn above the prompt. Three rows (Context, 5-hour, Weekly), one
 // scale of weather icons for all of them.
 //
-// Context, live: turn.step reads each model response's usage the moment it
-// finishes, so the band moves with every request of a turn (each tool round),
-// not once at its end. session.measure is the engine's own push of the same
-// figures the status line shows.
+// Context, exact where the API says it: turn.step reads each model response's
+// usage the moment it finishes (cached and uncached input), so the band moves
+// with every request of a turn. Where no response has said it yet (a fresh
+// session, after /compact or /clear) the row shows an estimate, marked `~`.
+// The draft in the prompt box is counted with the API's token counter as it
+// is typed, and added to what the next request will carry.
 //
 // Limits, exact: GET /api/oauth/usage, the endpoint /usage reads, sent with
 // the session's credential handle ($.session.authorize: the token itself
@@ -25,38 +27,55 @@
 // The host reads on(...) and $.noun.method(...) from source, so they are
 // spelled literally, and helpers that take $ are top-level functions.
 
-import type { EngineInterface, ModelUsage, Register, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
+import type { ApiMessage, EngineInterface, Register, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const COUNT_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
 const TICK_MS = 30_000 // countdowns redraw, and stale limits are refetched
+const WATCH_MS = 500 // the draft and the engine's context figure are read this often
 const MIN_FETCH_MS = 30_000 // at most one /usage read this often
 const REFRESH_MS = 5 * 60_000 // limits heard of longer ago than this are fetched again
 const STALE_MS = 15 * 60_000 // past this a limit row says how old it is
-const HISTORY = 16
-const SPARK = '▁▂▃▄▅▆▇█'
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
+// Claude Code shows a long paste as this placeholder and keeps the text aside.
+const PASTE = /\[Pasted text #(\d+)(?: \+(\d+) lines?)?\]/g
+const IMAGE = /\[Image #\d+\]/g
 
-// One scale for the context window and both limits, by percent used. Every
-// icon has emoji presentation by default, so each is two cells in any font.
+// One scale for the context window and both limits, by percent used. Each
+// icon carries U+FE0F, which asks for the emoji glyph: a coding font with its
+// own one-cell ⚡ (JetBrains Mono, Nerd Fonts) otherwise draws that, left in
+// the two cells the icon takes.
 const SKY = [
   { below: 25, icon: '🌞', color: 'success' },
-  { below: 50, icon: '⛅', color: 'success' },
-  { below: 75, icon: '☔', color: 'warning' },
-  { below: 90, icon: '⚡', color: 'warning' },
+  { below: 50, icon: '⛅\uFE0F', color: 'success' },
+  { below: 75, icon: '☔\uFE0F', color: 'warning' },
+  { below: 90, icon: '⚡\uFE0F', color: 'warning' },
   { below: 100, icon: '🌀', color: 'error' },
-  { below: Infinity, icon: '⛔', color: 'error' },
+  { below: Infinity, icon: '⛔\uFE0F', color: 'error' },
 ] as const
 type Sky = { icon: string; color?: string }
-const WAITING: Sky = { icon: '⏳' }
-const UNKNOWN: Sky = { icon: '❔' }
+const WAITING: Sky = { icon: '⏳\uFE0F' }
+const UNKNOWN: Sky = { icon: '❔\uFE0F' }
 
 type Limit = { used: number; resetsAt?: number; at: number }
 
 // The session's readings. Module state: a reload runs session.start again,
 // which reads everything afresh.
-let ctx: { tokens?: number; window?: number; compactAt?: number } = {}
-let history: number[] = []
-let turn: { id: string; step: number; from: number; added?: number } | undefined
+let ctx: {
+  window?: number
+  compactAt?: number
+  tokens?: number // exact: the last main-loop response's input
+  cached?: number // of which read from the prompt cache
+  uncached?: number // of which not: plain input and cache writes
+  output?: number // that response's own output, which the next request carries too
+  estimate?: number // when no response has measured the context yet
+  stale?: number // the engine's figure from before a compaction, until it lets go of it
+} = {}
+let draft: { text: string; tokens?: number; isEstimate?: boolean; missing?: number } = { text: '' }
+let pastes = new Map<string, string | null>() // placeholder id → the pasted text, null when unreadable
+let counted = new Map<string, number>() // text → its tokens, as counted
+let overhead: number | undefined // what count_tokens adds around one message
+let isCounting = false
 let limits: Record<string, Limit> = {}
 let limitsNote: string | undefined // why a limit row is empty, when it is
 let fetchedAt = -Infinity
@@ -64,13 +83,14 @@ let retryAt = 0
 let isFetching = false
 let hasTurnEnded = false
 let ticker: Timer | undefined
+let watcher: Timer | undefined
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     ctx = {}
-    history = []
-    turn = undefined
+    draft = { text: '' }
+    pastes = new Map()
     limits = {}
     limitsNote = undefined
     fetchedAt = -Infinity
@@ -79,19 +99,11 @@ export const register: Register = on => {
     await readUsage($)
     ticker?.cancel()
     ticker = $.clock.every(TICK_MS, () => void tick($))
+    watcher?.cancel()
+    watcher = $.clock.every(WATCH_MS, () => void watch($))
     // The first /usage read, off the startup path.
     $.clock.after(0, () => void fetchLimits($))
     return result
-  })
-
-  on('session.end', ($, e, next) => {
-    if (e.reason === 'clear') {
-      ctx = { window: ctx.window, compactAt: ctx.compactAt }
-      history = []
-      turn = undefined
-      $.ui.invalidate('ui.render')
-    }
-    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -106,24 +118,36 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId) {
-      return yield* next(e) // a subagent's window is its own
-    }
-    if (turn?.id !== e.turnId) {
-      turn = { id: e.turnId, step: 0, from: ctx.tokens ?? 0 }
-    }
-    const current = turn
-    current.step = e.index + 1
-    $.ui.invalidate('ui.render')
     const response = yield* next(e)
-    const tokens = contextTokens(response.usage)
-    if (tokens !== undefined) {
-      ctx.tokens = tokens
-      current.added = tokens - current.from
-      history = [...history, tokens].slice(-HISTORY)
+    const usage = response.usage
+    if (!e.agentId && usage) {
+      // A subagent's window is its own; this is the main conversation's.
+      const cached = usage.cache_read_input_tokens ?? 0
+      const uncached = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+      ctx = { window: ctx.window, compactAt: ctx.compactAt, tokens: cached + uncached, cached, uncached, output: usage.output_tokens ?? 0 }
       $.ui.invalidate('ui.render')
     }
     return response
+  })
+
+  // No measurement follows a compaction, and the engine's own figure keeps
+  // the old size for a while, so the row is put right here: the last exact
+  // size, less the messages compacted, plus the messages that replace them,
+  // both counted with the API's token counter.
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId || e.trigger === 'precompute') {
+      return next(e)
+    }
+    const exact = ctx.tokens === undefined ? undefined : ctx.tokens + (ctx.output ?? 0)
+    const before = await $.session.messages({ as: 'api' })
+    const beforeTokens = exact === undefined ? undefined : countTokens($, before) // alongside the compaction
+    const result = await next(e)
+    if (result.skip === undefined) {
+      ctx = { window: ctx.window, compactAt: ctx.compactAt, stale: ctx.tokens }
+      $.ui.invalidate('ui.render')
+      void estimateCompacted($, before, exact, beforeTokens)
+    }
+    return result
   })
 
   on('turn.complete', ($, e, next) => {
@@ -141,7 +165,7 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const columns = e.props.bodyColumns
     const rows = [
-      contextRow(columns, e.props.isWorking),
+      contextRow(),
       limitRow('5-hour', limits.five_hour, now, columns, false),
       limitRow('Weekly', limits.seven_day, now, columns, true),
     ]
@@ -179,15 +203,167 @@ export const register: Register = on => {
 }
 
 // The status line's figures, and the auto-compaction point from the summary
-// breakdown (a local estimate of the categories; it sends no request).
+// breakdown (a local estimate of the categories; it sends no request), whose
+// total stands in for the context until a response measures it.
 async function readUsage($: EngineInterface) {
   try {
     const usage = await $.session.usage({ breakdown: 'summary' })
     applyContext(usage.context)
     ctx.compactAt = usage.context.breakdown?.autoCompactThreshold
+    if (ctx.tokens === undefined && ctx.stale === undefined) {
+      ctx.estimate = usage.context.breakdown?.totalTokens
+    }
     applyLimits(usage.rateLimits, await $.clock.now())
   } catch {
     // The band keeps what it had.
+  }
+}
+
+// Every WATCH_MS: the draft, and whether the engine has let go of the context
+// figure (/clear, a rewind, the end of a compaction).
+async function watch($: EngineInterface) {
+  try {
+    const { context } = await $.session.usage()
+    if (context.tokens === undefined && ctx.stale !== undefined) {
+      ctx.stale = undefined // the compaction has settled
+    } else if (context.tokens === undefined && ctx.tokens !== undefined) {
+      ctx = { window: ctx.window, compactAt: ctx.compactAt }
+      $.ui.invalidate('ui.render')
+      await readUsage($)
+    }
+    const { text } = await $.prompt.read()
+    if (text !== draft.text) {
+      draft = { ...draft, text } // the last count shows until this one is in
+      $.ui.invalidate('ui.render')
+      await countDraft($)
+    }
+  } catch {
+    // Read again on the next round.
+  }
+}
+
+async function estimateCompacted($: EngineInterface, before: readonly ApiMessage[], exact: number | undefined, beforeTokens: Promise<number | undefined> | undefined) {
+  // The conversation the engine reads back changes a moment after the hook.
+  let after = before
+  for (let i = 0; i < 20 && sameStart(after, before); i++) {
+    await new Promise<void>(resolve => $.clock.after(WATCH_MS, resolve))
+    after = await $.session.messages({ as: 'api' })
+  }
+  const was = exact === undefined ? undefined : await beforeTokens
+  const now = was === undefined ? undefined : await countTokens($, after)
+  if (ctx.tokens !== undefined) {
+    return // a response has measured it meanwhile
+  }
+  if (exact !== undefined && was !== undefined && now !== undefined) {
+    ctx.estimate = Math.max(0, exact - was + now)
+  } else {
+    await readUsage($)
+  }
+  $.ui.invalidate('ui.render')
+}
+
+function sameStart(a: readonly ApiMessage[], b: readonly ApiMessage[]) {
+  return a.length === b.length && JSON.stringify(a[0]) === JSON.stringify(b[0])
+}
+
+// The draft's tokens: the typed text and each paste counted apart (a paste
+// once), less what the counter adds around a message. Commands and shell
+// lines (`/`, `!`) are not sent to the model as typed and are not counted.
+async function countDraft($: EngineInterface) {
+  if (isCounting) {
+    return // the running count looks again when it ends
+  }
+  isCounting = true
+  try {
+    for (let text = ''; text !== draft.text; ) {
+      text = draft.text
+      const result = /^\s*([/!]|$)/.test(text) ? {} : await draftTokens($, text)
+      if (text === draft.text) {
+        draft = { text, ...result }
+        $.ui.invalidate('ui.render')
+      }
+    }
+  } finally {
+    isCounting = false
+  }
+}
+
+async function draftTokens($: EngineInterface, text: string) {
+  const pieces = [text.replace(PASTE, '').replace(IMAGE, '')]
+  let missing = (text.match(IMAGE) ?? []).length
+  for (const [, id, lines] of text.matchAll(PASTE)) {
+    if (!pastes.has(id!)) {
+      pastes.set(id!, await readPaste($, lines === undefined ? undefined : Number(lines)))
+    }
+    const pasted = pastes.get(id!)
+    if (pasted) {
+      pieces.push(pasted)
+    } else {
+      missing += 1
+    }
+  }
+  let tokens = 0
+  let isEstimate = false
+  for (const piece of pieces.filter(p => p.trim())) {
+    let n = counted.get(piece)
+    if (n === undefined) {
+      const total = await countTokens($, [{ role: 'user', content: [{ type: 'text', text: piece }] }])
+      overhead ??= total === undefined ? undefined : await messageOverhead($)
+      if (total !== undefined && overhead !== undefined) {
+        n = Math.max(0, total - overhead)
+        if (counted.size > 100) counted.clear() // ponytail: each typed prefix is a key; a bounded LRU if it matters
+        counted.set(piece, n)
+      }
+    }
+    if (n === undefined) {
+      n = Math.ceil(piece.length / 4) // ponytail: rough chars/4 when the counter can't be reached
+      isEstimate = true
+    }
+    tokens += n
+  }
+  return { tokens, isEstimate, missing }
+}
+
+// The text of a paste Claude Code shows as a placeholder: the clipboard, if it
+// still holds a text of the placeholder's line count (macOS, pbpaste).
+async function readPaste($: EngineInterface, lines: number | undefined) {
+  try {
+    const { exitCode, stdout, isStdoutTruncated } = await $.process.run(['pbpaste'], { timeoutMs: 2000 })
+    const newlines = (stdout.match(/\n/g) ?? []).length
+    const isMatch = lines === undefined ? newlines === 0 : Math.abs(newlines - lines) <= 1
+    return exitCode === 0 && !isStdoutTruncated && stdout && isMatch ? stdout : null
+  } catch {
+    return null
+  }
+}
+
+async function messageOverhead($: EngineInterface) {
+  const one = await countTokens($, [{ role: 'user', content: [{ type: 'text', text: 'a' }] }])
+  return one === undefined ? undefined : one - 1
+}
+
+// The API's token counter (POST /v1/messages/count_tokens), for the session's
+// model, with the session's credential handle; undefined when it can't answer.
+async function countTokens($: EngineInterface, messages: readonly ApiMessage[]) {
+  try {
+    const auth = await $.session.authorize()
+    if (!auth || messages.length === 0) {
+      return undefined
+    }
+    const response = await $.http.fetch(COUNT_URL, {
+      method: 'POST',
+      auth: auth.handle,
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        ...(auth.kind === 'bearer' ? { 'anthropic-beta': 'oauth-2025-04-20' } : {}),
+      },
+      body: JSON.stringify({ model: await $.session.model(), messages }),
+    })
+    const n = response.ok ? (JSON.parse(response.text) as { input_tokens?: unknown }).input_tokens : undefined
+    return typeof n === 'number' ? n : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -251,24 +427,20 @@ async function fetchLimits($: EngineInterface) {
   }
 }
 
+// The engine's figure is the last response's input as a whole; the cached
+// split stays only while it still describes that figure.
 function applyContext(context: SessionContextUsage) {
   ctx.window = context.window
-  ctx.tokens = context.tokens
+  if (context.tokens === undefined || context.tokens === ctx.stale || context.tokens === ctx.tokens) {
+    return
+  }
+  ctx = { window: ctx.window, compactAt: ctx.compactAt, tokens: context.tokens }
 }
 
 function applyLimits(list: readonly SessionRateLimit[], now: number) {
   for (const limit of list) {
     limits[limit.kind] = { used: limit.percentUsed, resetsAt: timeOf(limit.resetsAt), at: now }
   }
-}
-
-// The input side of one response: what the next request is answered over,
-// the figure the status line and $.session.usage() report.
-function contextTokens(usage: ModelUsage | null | undefined) {
-  if (!usage) {
-    return undefined
-  }
-  return (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0)
 }
 
 type Row = {
@@ -281,40 +453,57 @@ type Row = {
   shortDetail?: string
 }
 
-function contextRow(columns: number, isWorking: boolean): Row {
+function contextRow(): Row {
   const window = ctx.window ?? 0
-  const tokens = ctx.tokens
+  const isExact = ctx.tokens !== undefined
+  const tokens = ctx.tokens ?? ctx.estimate
+  const parts: string[] = []
+  const draftPart = draftDetail(tokens)
   if (tokens === undefined) {
-    return {
-      label: 'Context',
-      short: 'ctx',
-      sky: WAITING,
-      ratio: 0,
-      percent: '—',
-      detail: `of ${short(window)} · fills in after the first response`,
-    }
+    parts.push(`of ${short(window)} · estimating…`)
+    if (draftPart) parts.push(draftPart)
+    return { label: 'Context', short: 'ctx', sky: WAITING, ratio: 0, percent: '—', detail: parts.join(' · ') }
   }
+  const mark = isExact ? '' : '~'
+  parts.push(`${mark}${short(tokens)} / ${short(window)}${isExact ? '' : ' estimated'}`)
+  if (draftPart) parts.push(draftPart)
+  if (ctx.cached !== undefined && ctx.uncached !== undefined) {
+    parts.push(`${short(ctx.cached)} cached · ${short(ctx.uncached)} uncached`)
+  }
+  parts.push(ctx.compactAt ? `${mark}${short(Math.max(0, ctx.compactAt - tokens))} to auto-compact` : `${mark}${short(Math.max(0, window - tokens))} free`)
   // The weather counts toward auto-compaction, where the window really ends;
   // the percentage is of the whole window, as the status line has it.
-  const limit = ctx.compactAt ?? window
-  const parts = [`${short(tokens)} / ${short(window)}`]
-  parts.push(ctx.compactAt ? `${short(Math.max(0, ctx.compactAt - tokens))} to auto-compact` : `${short(Math.max(0, window - tokens))} free`)
-  if (turn?.added !== undefined) {
-    const sign = turn.added >= 0 ? `▲ +${short(turn.added)}` : `▼ ${short(-turn.added)}`
-    parts.push(isWorking ? `● ${sign} this turn, step ${turn.step}` : `${sign} last turn`)
-  }
-  let detail = parts.join(' · ')
-  if (columns >= 120 && history.length > 1) {
-    detail += `  ${spark()}`
-  }
   return {
     label: 'Context',
     short: 'ctx',
-    sky: skyFor((tokens / limit) * 100),
+    sky: skyFor((tokens / (ctx.compactAt ?? window)) * 100),
     ratio: tokens / window,
-    percent: `${Math.round((tokens / window) * 100)}%`,
-    detail,
+    percent: `${mark}${Math.round((tokens / window) * 100)}%`,
+    detail: parts.join(' · '),
+    shortDetail: draft.tokens ? ` +${short(draft.tokens)}` : undefined,
   }
+}
+
+// The draft's tokens and what the next request will be answered over: the
+// context, the last reply (it joins the conversation) and the draft. Always
+// `~`: the engine adds reminders of its own to what it sends.
+function draftDetail(context: number | undefined) {
+  if (/^\s*([/!]|$)/.test(draft.text)) {
+    return undefined
+  }
+  if (draft.tokens === undefined) {
+    return 'draft counting…'
+  }
+  const isLow = (draft.missing ?? 0) > 0
+  const mark = isLow ? '≥' : draft.isEstimate ? '~' : ''
+  let text = `draft ${mark}${short(draft.tokens)}`
+  if (isLow) {
+    text += ` (${draft.missing} uncounted)`
+  }
+  if (context !== undefined) {
+    text += ` → next ${isLow ? '≥' : '~'}${short(context + (ctx.output ?? 0) + draft.tokens)}`
+  }
+  return text
 }
 
 function limitRow(label: string, limit: Limit | undefined, now: number, columns: number, isWeekly: boolean): Row {
@@ -367,12 +556,6 @@ function filled(ratio: number, width: number) {
   const whole = Math.floor(cells)
   const part = whole < width ? EIGHTHS[Math.floor((cells - whole) * 8)] ?? '' : ''
   return '█'.repeat(whole) + part
-}
-
-// Bars scale to the fullest reading shown, so growth shows at any fill level.
-function spark() {
-  const top = Math.max(...history, 1)
-  return history.map(t => SPARK[Math.min(SPARK.length - 1, Math.floor((t / top) * (SPARK.length - 1)))]).join('')
 }
 
 function fit(text: string, room: number) {

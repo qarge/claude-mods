@@ -35,6 +35,19 @@ type World = {
   usage?: () => SessionUsage
   authorize?: () => { handle: string; kind: 'bearer' | 'api-key' } | null
   fetch?: () => HttpResponse
+  draft?: () => string
+  clipboard?: () => string
+  messages?: () => unknown[]
+  canCount?: boolean
+}
+
+const COUNT_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
+
+// The test's token counter: 8 around the request, one per character.
+function counter(body: string | undefined): HttpResponse {
+  const { messages } = JSON.parse(body ?? '{}') as { messages: { content: { text?: string }[] }[] }
+  const chars = messages.flatMap(m => m.content).reduce((n, b) => n + (b.text?.length ?? 0), 0)
+  return ok({ input_tokens: 8 + chars })
 }
 
 function ok(body: unknown): HttpResponse {
@@ -55,16 +68,24 @@ function world(on: On, w: World = {}) {
       ? w.usage()
       : ({
           startedAt: NOW,
-          context: { window: 200_000, breakdown: { autoCompactThreshold: 160_000 } },
+          context: { window: 200_000, breakdown: { autoCompactThreshold: 160_000, totalTokens: 40_000 } },
           rateLimits: [],
         } as unknown as SessionUsage),
   }))
   on('session.authorize', () => ({ value: w.authorize ? w.authorize() : { handle: 'handle', kind: 'bearer' } }))
   on('http.fetch', (_$, e) => {
     fetches.push(e.url)
+    if (e.url === COUNT_URL) {
+      if (w.canCount === false) throw new Error('offline')
+      return { value: counter(e.init?.body) }
+    }
     return { value: w.fetch ? w.fetch() : ok(USAGE_BODY) }
   })
-  return { clock, fetches }
+  on('session.model', () => ({ value: 'claude-test' }))
+  on('prompt.read', () => ({ value: { text: w.draft?.() ?? '', cursor: 0 } }))
+  on('session.messages', () => ({ value: (w.messages?.() ?? []) as never }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: w.clipboard?.() ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  return { clock, fetches, counts: () => fetches.filter(u => u === COUNT_URL).length }
 }
 
 async function start($: Engine, clock: MockClock) {
@@ -106,10 +127,10 @@ describe('limits', () => {
       expect(r.fiveHour).toContain('8%')
       expect(r.fiveHour).toContain('92% left · resets in 2h 13m')
       // 66.4 is shown as 66, rounded down as /usage rounds it.
-      expect(r.weekly).toMatch(/^☔ Weekly/)
+      expect(r.weekly).toMatch(/^☔\uFE0F Weekly/)
       expect(r.weekly).toContain('66%')
       expect(r.weekly).toContain('34% left · resets in 1d 20h')
-      expect(r.context).toContain('fills in after the first response')
+      expect(r.context).toContain('~40k / 200k estimated')
       await ui.unmount()
     }
   })
@@ -129,7 +150,7 @@ describe('limits', () => {
     expect(r.fiveHour).toMatch(/^🌀 5-hour/)
     expect(r.fiveHour).toContain('91%')
     expect(r.fiveHour).toContain('9% left · resets in 30m')
-    expect(r.weekly).toMatch(/^⛔ Weekly/)
+    expect(r.weekly).toMatch(/^⛔\uFE0F Weekly/)
     expect(r.weekly).toContain('0% left')
   })
 
@@ -213,7 +234,7 @@ describe('limits', () => {
     await start($, clock)
     const r = await rows(await $.ui.mount(band()))
     expect(fetches).toHaveLength(0)
-    expect(r.fiveHour).toMatch(/^❔ 5-hour/)
+    expect(r.fiveHour).toMatch(/^❔\uFE0F 5-hour/)
     expect(r.fiveHour).toContain('unavailable: needs a claude.ai subscription login')
   })
 
@@ -269,7 +290,7 @@ describe('limits', () => {
 })
 
 describe('context', () => {
-  test('moves with every model request of a turn, not only at its end', async ($, on) => {
+  test('moves with every model request of a turn, split into cached and uncached', async ($, on) => {
     const { clock } = world(on)
     const perStep = [usage(2_000, 118_000), usage(1_000, 149_000)]
     on('turn.step', async function* (_$, e) {
@@ -282,9 +303,10 @@ describe('context', () => {
 
     await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 1 })
     let r = await rows(ui)
-    expect(r.context).toMatch(/^⚡ Context/) // 120k of a 160k compaction point
+    expect(r.context).toMatch(/^⚡️ Context/) // 120k of a 160k compaction point
     expect(r.context).toContain('60%')
-    expect(r.context).toContain('120k / 200k · 40k to auto-compact · ● ▲ +120k this turn, step 1')
+    expect(r.context).toContain('120k / 200k · 118k cached · 2k uncached · 40k to auto-compact')
+    expect(r.context).not.toMatch(/turn|step|[▁▂▃▄▅▆▇]/)
 
     // A subagent's request is its own window: the band does not move.
     await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 1, agentId: 'a1' })
@@ -294,20 +316,104 @@ describe('context', () => {
     r = await rows(ui)
     expect(r.context).toMatch(/^🌀 Context/)
     expect(r.context).toContain('75%')
-    expect(r.context).toContain('150k / 200k · 10k to auto-compact · ● ▲ +150k this turn, step 2')
+    expect(r.context).toContain('150k / 200k · 149k cached · 1k uncached · 10k to auto-compact')
 
-    await ui.redraw({ ...PROPS, isWorking: false })
-    expect((await rows(ui)).context).toContain('▲ +150k last turn')
+    // The engine's push of the same figure keeps the split.
+    await $.session.measure({ context: { window: 200_000, tokens: 150_000, percent: 75 }, rateLimits: [], changed: ['context'] })
+    expect((await rows(ui)).context).toContain('149k cached')
   })
 
-  test('/clear empties the context row', async ($, on) => {
-    const { clock } = world(on)
+  test('/compact: the row is estimated from the messages compacted and their replacement', async ($, on) => {
+    let compacted = false
+    let engineTokens: number | undefined
+    const before = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(30_000) }] }]
+    const after = [{ role: 'user', content: [{ type: 'text', text: 'summary '.repeat(500) }] }]
+    const { clock } = world(on, {
+      messages: () => (compacted ? after : before),
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 99_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
     await start($, clock)
-    await $.session.measure({ context: { window: 200_000, tokens: 30_000, percent: 15 }, rateLimits: [], changed: ['context'] })
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    engineTokens = 50_000
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).context).toContain('50k / 200k')
+
+    const done = $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    await done
+    // The engine still says 50k for a while; the row doesn't.
+    expect((await rows(ui)).context).toContain('estimating…')
+    compacted = true
+    await clock.advance(1_000)
+    // 50k + the 500-token reply, less 30k compacted, plus the 4k summary.
+    expect((await rows(ui)).context).toContain('~24.5k / 200k estimated')
+    engineTokens = undefined
+    await clock.advance(1_000)
+    expect((await rows(ui)).context).toContain('~24.5k / 200k estimated')
+
+    // The next response measures it exactly.
+    await step($, { turnId: 't2', index: 0, model: 'claude-test', messageCount: 2 })
+    expect((await rows(ui)).context).toContain('50k / 200k · 49.5k cached')
+  })
+
+  test('when the engine lets go of its figure (/clear), the row falls back to the estimate', async ($, on) => {
+    let tokens: number | undefined = 30_000
+    const { clock } = world(on, {
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 12_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    await start($, clock)
     const ui = await $.ui.mount(band())
     expect((await rows(ui)).context).toMatch(/^🌞 Context.*15%/)
-    await $.session.end({ reason: 'clear', sessionId: 's', resume: { id: 's' } } as never)
-    expect((await rows(ui)).context).toContain('fills in after the first response')
+    tokens = undefined
+    await clock.advance(500)
+    expect((await rows(ui)).context).toContain('~12k / 200k estimated')
+  })
+
+  test('counts the draft as it is typed, pastes included, and adds it to the next request', async ($, on) => {
+    let draft = ''
+    let clipboard = ''
+    const { clock, counts } = world(on, { draft: () => draft, clipboard: () => clipboard })
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    draft = 'hello world'
+    await clock.advance(500)
+    // 11 characters, 11 tokens in the test's counter; 40k context.
+    expect((await rows(ui)).context).toContain('~40k / 200k estimated · draft 11 → next ~40k')
+
+    // A paste Claude Code shows as a placeholder: the clipboard holds it.
+    clipboard = 'p'.repeat(2_000) + '\n' + 'q'.repeat(999)
+    draft = 'look: [Pasted text #1 +1 lines]'
+    await clock.advance(500)
+    const shown = (await rows(ui)).context
+    expect(shown).toContain('draft 3k → next ~43k') // 'look: ' and the 3,000 pasted
+    const used = counts()
+    draft = 'look at this: [Pasted text #1 +1 lines]'
+    await clock.advance(500)
+    expect(counts() - used).toBe(1) // only the typed text again; the paste was counted once
+
+    // A clipboard that no longer matches the placeholder is not guessed at.
+    clipboard = 'something else'
+    draft = 'and [Pasted text #1 +1 lines] [Pasted text #2 +40 lines] [Image #1]'
+    await clock.advance(500)
+    expect((await rows(ui)).context).toContain('draft ≥3k (2 uncounted)') // #1 as read when it was pasted
+
+    // Commands are not sent as typed.
+    draft = '/compact'
+    await clock.advance(500)
+    expect((await rows(ui)).context).not.toContain('draft')
+  })
+
+  test('without the token counter the draft is estimated, and says so', async ($, on) => {
+    const { clock } = world(on, { draft: () => 'x'.repeat(400), canCount: false })
+    await start($, clock)
+    await clock.advance(500)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('draft ~100')
   })
 })
 
@@ -317,7 +423,7 @@ describe('layout', () => {
     await start($, clock)
     const ui = await $.ui.mount(band({ maxRows: 2 }))
     const line = await ui.find({ type: 'Text', text: /5h/ })
-    expect(line?.text).toBe('⏳ ctx —  🌞 5h 8% ↻2h 13m  ☔ wk 66% ↻1d 20h')
+    expect(line?.text).toBe('⛅\uFE0F ctx ~20%  🌞 5h 8% ↻2h 13m  ☔\uFE0F wk 66% ↻1d 20h')
   })
 
   test('no row is wider than the band', async ($, on) => {
@@ -326,8 +432,8 @@ describe('layout', () => {
     for (const bodyColumns of [50, 72, 100, 150]) {
       const r = await rows(await $.ui.mount(band({ bodyColumns })))
       for (const text of Object.values(r)) {
-        // Each icon is one code point drawn two cells wide; padding is 2.
-        expect([...text].length + 1 + 2).toBeLessThanOrEqual(bodyColumns)
+        // Each icon is drawn two cells wide (U+FE0F takes none); padding is 2.
+        expect([...text.replace(/\uFE0F/g, '')].length + 1 + 2).toBeLessThanOrEqual(bodyColumns)
       }
     }
   })
