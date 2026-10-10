@@ -30,16 +30,19 @@
 // The host reads on(...) and $.noun.method(...) from source, so they are
 // spelled literally, and helpers that take $ are top-level functions.
 
-import type { ApiMessage, EngineInterface, Register, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
+import type { ApiMessage, EngineInterface, Register, SessionContextUsage, Timer } from 'claude-code'
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const COUNT_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
 const TICK_MS = 30_000 // countdowns redraw, and stale limits are refetched
 const WATCH_MS = 500 // the session id and the engine's context figure are read this often
 const MIN_FETCH_MS = 30_000 // at most one /usage read this often
+const FETCH_GIVE_UP_MS = 60_000 // a /usage read unanswered this long is let go
+const COUNT_GIVE_UP_MS = 20_000 // a compaction's count past this gives way to the engine's estimate
 const REFRESH_MS = 5 * 60_000 // limits heard of longer ago than this are fetched again
 const STALE_MS = 15 * 60_000 // past this a limit row says how old it is
 const STORE_KEY = 'limits' // the last readings, across sessions
+const KINDS = ['five_hour', 'seven_day'] // the windows the rows show
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 
 // One scale for the context window and both limits, by percent used. Each
@@ -76,27 +79,34 @@ let ctx: {
 } = {}
 let limits: Record<string, Limit> = {}
 let limitsNote: string | undefined // why a limit row is empty, when it is
+let hasRead = false // /usage has answered: a window it leaves out has none open
 let fetchedAt = -Infinity
 let retryAt = 0
 let isFetching = false
+let fetchGen = 0 // the /usage read whose answer counts: a newer one, once an older is given up
 let hasTurnEnded = false
 let ticker: Timer | undefined
 let watcher: Timer | undefined
+let isWatching = false
+let isCounting = false // a compaction's messages are being counted
+let heard: number | undefined // the engine's context figure, as last read
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     limits = saved(await $.store.get(STORE_KEY).catch(() => undefined), await $.clock.now())
     limitsNote = undefined
+    hasRead = false
     fetchedAt = -Infinity
     retryAt = 0
     hasTurnEnded = false
-    void fetchLimits($) // not awaited: the engine starts meanwhile
+    fetchLimits($).catch(() => {}) // not awaited: the engine starts meanwhile
     const result = await next(e)
     session = await $.session.id()
     ctx = {}
     await readUsage($)
+    $.ui.invalidate('ui.render') // the band can draw now that the window is known
     ticker?.cancel()
-    ticker = $.clock.every(TICK_MS, () => void tick($))
+    ticker = $.clock.every(TICK_MS, () => void tick($).catch(() => {}))
     watcher?.cancel()
     watcher = $.clock.every(WATCH_MS, () => void watch($))
     return result
@@ -116,9 +126,22 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const isNewWindow = e.context.window !== ctx.window
-    applyContext(e.context)
-    applyLimits(e.rateLimits, await $.clock.now())
-    if (e.rateLimits.length > 0) {
+    // Like the rate limits, the context figure rides along with every
+    // measure; it is news only when it moved.
+    if (e.changed.includes('context')) {
+      applyContext(e.context)
+    } else {
+      ctx.window = e.context.window
+    }
+    // The rate limits ride along with every measure, as the last response
+    // left them; they are news only when they moved.
+    if (e.changed.includes('rateLimits')) {
+      const now = await $.clock.now()
+      for (const limit of e.rateLimits) {
+        if (KINDS.includes(limit.kind)) {
+          setLimit(limit.kind, limit.percentUsed, timeOf(limit.resetsAt), now, true)
+        }
+      }
       keepLimits($)
     }
     if (isNewWindow) {
@@ -157,7 +180,13 @@ export const register: Register = on => {
     if (result.skip === undefined) {
       ctx = { window: ctx.window, compactAt: ctx.compactAt, stale: ctx.tokens }
       $.ui.invalidate('ui.render')
-      void estimateCompacted($, session, before, exact, beforeTokens)
+      isCounting = true
+      Promise.race([
+        estimateCompacted($, session, before, exact, beforeTokens),
+        new Promise<never>((_, reject) => $.clock.after(COUNT_GIVE_UP_MS, () => reject(new Error('count timed out')))),
+      ])
+        .catch(() => readUsage($).then(() => $.ui.invalidate('ui.render')))
+        .finally(() => (isCounting = false))
     }
     return result
   })
@@ -221,42 +250,64 @@ export const register: Register = on => {
 async function readUsage($: EngineInterface) {
   try {
     const usage = await $.session.usage({ breakdown: 'summary' })
+    heard = usage.context.tokens
+    if (heard === undefined) {
+      ctx.stale = undefined // the engine has let go of the size before a compaction
+    }
     applyContext(usage.context)
     ctx.compactAt = usage.context.breakdown?.autoCompactThreshold
     if (ctx.tokens === undefined && ctx.stale === undefined) {
       ctx.estimate = usage.context.breakdown?.totalTokens
     }
-    applyLimits(usage.rateLimits, await $.clock.now())
   } catch {
     // The band keeps what it had.
   }
 }
 
 // Every WATCH_MS: whether another chat is on screen (/clear, /resume), and
-// whether the engine has let go of the context figure (a compaction settled,
-// a rewind). Either way the chat's own figures are read afresh: the engine's
-// exact one for a resumed chat, else its estimate.
+// whether the engine's context figure moved with no measure (a rewind) or
+// was let go (a compaction settled, a rewind). Another chat, or a figure let
+// go, is read afresh: the engine's exact one for a resumed chat, else its
+// estimate. A response the engine hasn't taken in yet is no change.
 async function watch($: EngineInterface) {
+  if (isWatching) {
+    return
+  }
+  isWatching = true
   try {
     const id = await $.session.id()
     if (id === ended) {
       return // the chat that ended is still the engine's for a moment
     }
     const { context } = await $.session.usage()
+    const was = heard
+    heard = context.tokens
     if (id !== session) {
       session = id
       ended = undefined
-    } else if (context.tokens === undefined && ctx.stale !== undefined) {
+    } else if (context.tokens === was) {
+      return
+    } else if (context.tokens !== undefined) {
+      // Down with no measure is a rewind; up is the next request taken in
+      // early, which its step measures with the split.
+      if (ctx.tokens === undefined || context.tokens < ctx.tokens) {
+        applyContext(context)
+        $.ui.invalidate('ui.render')
+      }
+      return
+    } else if (ctx.stale !== undefined) {
       ctx.stale = undefined // the compaction has settled
-      return
-    } else if (context.tokens !== undefined || ctx.tokens === undefined) {
-      return
+      if (ctx.estimate !== undefined || isCounting) {
+        return // its messages are counted, or being counted
+      }
     }
     ctx = { window: ctx.window, compactAt: ctx.compactAt }
     await readUsage($)
     $.ui.invalidate('ui.render')
   } catch {
     // Read again on the next round.
+  } finally {
+    isWatching = false
   }
 }
 
@@ -265,6 +316,9 @@ async function estimateCompacted($: EngineInterface, chat: string | undefined, b
   let after = before
   for (let i = 0; i < 20 && sameStart(after, before); i++) {
     await new Promise<void>(resolve => $.clock.after(WATCH_MS, resolve))
+    if (session !== chat) {
+      return // another chat is on screen: its messages are not counted
+    }
     after = await $.session.messages({ as: 'api' })
   }
   const was = exact === undefined ? undefined : await beforeTokens
@@ -315,9 +369,10 @@ async function tick($: EngineInterface) {
   if (now < retryAt || now - fetchedAt < MIN_FETCH_MS) {
     return
   }
-  const readings = Object.values(limits)
+  const readings = KINDS.flatMap(kind => limits[kind] ?? [])
   const lastHeard = Math.max(fetchedAt, ...readings.map(l => l.at))
-  const hasReset = readings.some(l => l.resetsAt !== undefined && l.resetsAt <= now)
+  // Once: a reading taken after its own reset waits for the usual refresh.
+  const hasReset = readings.some(l => l.resetsAt !== undefined && l.resetsAt <= now && l.at < l.resetsAt)
   if (hasTurnEnded || hasReset || now - lastHeard >= REFRESH_MS) {
     hasTurnEnded = false
     await fetchLimits($)
@@ -325,25 +380,33 @@ async function tick($: EngineInterface) {
 }
 
 async function fetchLimits($: EngineInterface) {
-  if (isFetching) {
+  const now = await $.clock.now()
+  if (isFetching && now - fetchedAt < FETCH_GIVE_UP_MS) {
     return
   }
   isFetching = true
-  const now = await $.clock.now()
   fetchedAt = now
+  const gen = ++fetchGen
   try {
     const auth = await $.session.authorize()
+    if (gen !== fetchGen) {
+      return
+    }
     if (auth?.kind !== 'bearer') {
-      // An API key, a gateway or a third-party provider: no plan limits.
+      // An API key, a gateway or a third-party provider: no plan limits, until
+      // a /login (asked again with each refresh).
       limits = {}
       limitsNote = 'needs a claude.ai subscription login'
-      retryAt = Infinity
+      retryAt = now + REFRESH_MS
       return
     }
     const response = await $.http.fetch(USAGE_URL, {
       auth: auth.handle,
       headers: { 'Content-Type': 'application/json', 'anthropic-beta': 'oauth-2025-04-20' },
     })
+    if (gen !== fetchGen) {
+      return // given up on, and a newer read has started
+    }
     if (!response.ok) {
       const seconds = Number(response.headers['retry-after'])
       retryAt = now + (seconds > 0 ? seconds * 1000 : response.status >= 500 ? 2 * 60_000 : REFRESH_MS)
@@ -352,21 +415,28 @@ async function fetchLimits($: EngineInterface) {
     }
     const data: unknown = JSON.parse(response.text)
     let hasAny = false
-    for (const kind of ['five_hour', 'seven_day']) {
+    for (const kind of KINDS) {
       const window = (data as Record<string, { utilization?: unknown; resets_at?: unknown } | null>)?.[kind]
       if (typeof window?.utilization === 'number') {
-        setLimit(kind, window.utilization, timeOf(window.resets_at), now)
+        setLimit(kind, window.utilization, timeOf(window.resets_at), now, false)
         hasAny = true
+      } else {
+        delete limits[kind] // /usage lists no such window now, and shows none
       }
     }
     limitsNote = hasAny ? undefined : 'no 5-hour or weekly limit on this plan'
+    hasRead = true
     retryAt = 0
     keepLimits($)
   } catch {
-    retryAt = now + 2 * 60_000
-    limitsNote = '/usage could not be read'
+    if (gen === fetchGen) {
+      retryAt = now + 2 * 60_000
+      limitsNote = '/usage could not be read'
+    }
   } finally {
-    isFetching = false
+    if (gen === fetchGen) {
+      isFetching = false
+    }
     $.ui.invalidate('ui.render')
   }
 }
@@ -381,18 +451,21 @@ function applyContext(context: SessionContextUsage) {
   ctx = { window: ctx.window, compactAt: ctx.compactAt, tokens: context.tokens }
 }
 
-function applyLimits(list: readonly SessionRateLimit[], now: number) {
-  for (const limit of list) {
-    setLimit(limit.kind, limit.percentUsed, timeOf(limit.resetsAt), now)
-  }
-}
-
-// A window's use only grows until it resets. The headers' figure runs a point
-// under /usage's (78 to 79), so within one window the higher one stands.
-function setLimit(kind: string, used: number, resetsAt: number | undefined, now: number) {
+// /usage's figure stands as read. A window's use only grows until it resets,
+// and the headers' figure runs a point under /usage's (78 to 79), so within
+// one window a header never lowers it; a header of a window that reset before
+// the one on hand is an old one.
+function setLimit(kind: string, used: number, resetsAt: number | undefined, now: number, isHeader: boolean) {
   const had = limits[kind]
-  const isSameWindow = had?.resetsAt !== undefined && resetsAt !== undefined && Math.abs(had.resetsAt - resetsAt) < 60_000
-  limits[kind] = { used: isSameWindow ? Math.max(had.used, used) : used, resetsAt, at: now }
+  if (isHeader && had?.resetsAt !== undefined && resetsAt !== undefined) {
+    if (resetsAt < had.resetsAt - 60_000) {
+      return
+    }
+    if (resetsAt - had.resetsAt < 60_000) {
+      used = Math.max(had.used, used)
+    }
+  }
+  limits[kind] = { used, resetsAt, at: now }
 }
 
 // The readings for the next session's first frame, whichever session made them last.
@@ -400,11 +473,13 @@ function keepLimits($: EngineInterface) {
   $.store.set(STORE_KEY, limits).catch(() => {})
 }
 
-// A kept reading, less what can't stand: a window that has reset since.
+// A kept reading, less what can't stand: a window that has reset since, or a
+// value no reading has.
 function saved(value: unknown, now: number) {
   const kept: Record<string, Limit> = {}
-  for (const [kind, l] of Object.entries((value ?? {}) as Record<string, Partial<Limit> | null>)) {
-    if (typeof l?.used === 'number' && typeof l.at === 'number' && typeof l.resetsAt === 'number' && l.resetsAt > now) {
+  for (const kind of KINDS) {
+    const l = (value as Record<string, Partial<Limit> | null> | undefined)?.[kind]
+    if (typeof l?.used === 'number' && l.used >= 0 && l.used < 1000 && typeof l.at === 'number' && l.at <= now && typeof l.resetsAt === 'number' && l.resetsAt > now) {
       kept[kind] = { used: l.used, resetsAt: l.resetsAt, at: l.at }
     }
   }
@@ -452,10 +527,10 @@ function limitRow(label: string, limit: Limit | undefined, now: number, columns:
     return {
       label,
       short: shortLabel,
-      sky: limitsNote ? UNKNOWN : WAITING,
+      sky: limitsNote || hasRead ? UNKNOWN : WAITING,
       ratio: 0,
       percent: '—',
-      detail: limitsNote ? `unavailable: ${limitsNote}` : 'reading /usage…',
+      detail: limitsNote ? `unavailable: ${limitsNote}` : hasRead ? 'none open now (/usage lists none)' : 'reading /usage…',
     }
   }
   // Whole percents rounded down, as /usage shows them.
@@ -536,7 +611,7 @@ function timeOf(iso: unknown) {
 }
 
 function short(n: number) {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  if (n >= 999_950) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}k`
   return String(n)
 }

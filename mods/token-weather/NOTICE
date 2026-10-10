@@ -39,6 +39,7 @@ Changes by qarge, 2026-10-10 (version 0.3.0):
   - the draft in the prompt box, pastes included, counted with the API's
     token counter, and the size of the next request (removed in 0.4.0);
   - every icon outside the emoji block carries U+FE0F.
+- .claude-plugin/plugin.json: version 0.3.0 and a new description.
 - README.md and the tests describe and cover the above.
 
 Changes by qarge, 2026-10-10 (version 0.4.0):
@@ -48,6 +49,7 @@ Changes by qarge, 2026-10-10 (version 0.4.0):
   - the context figures are kept with the session id they were measured
     in: /clear and /resume drop them (session.end), a draw for another
     chat shows none, and the next chat's own figures are read.
+- .claude-plugin/plugin.json: version 0.4.0 and a new description.
 - README.md and the tests describe and cover the above.
 
 Changes by qarge, 2026-10-10 (version 0.4.1):
@@ -57,6 +59,31 @@ Changes by qarge, 2026-10-10 (version 0.4.1):
     starts on the last one, less any window that has reset since;
   - the first /usage read starts alongside the engine's start;
   - within one window the higher of the /usage and header figures stands.
+- .claude-plugin/plugin.json: version 0.4.1.
+- README.md and the tests describe and cover the above.
+
+Changes by qarge, 2026-10-10 (version 0.4.2), after a code review:
+
+- hooks/token-weather.tsx:
+  - after /compact with no count of the messages, the row takes Claude
+    Code's estimate once the engine lets go of the old size, or after 20
+    seconds of counting, and not while the count is still running; a
+    measure whose context didn't move is not applied;
+  - the context watch tells a figure the engine hasn't taken in yet from
+    one it let go, and follows a figure it lowers with no measure (a
+    rewind), not one it raises before the step ends;
+  - a compaction's count stops when another chat is on screen;
+  - /usage's figures stand as read; only a header is kept from lowering
+    one, and a header of an older window, or one that only rides along
+    with a measure, is ignored;
+  - a window /usage stops listing is dropped, and a reset it goes on
+    listing after it passed is asked about once; a /usage read that never
+    answers is let go after a minute, and a late answer is ignored; a
+    login made after the start is picked up; only the 5-hour and weekly
+    windows are kept and stored;
+  - the band is redrawn once the start has read the window, failures of
+    unawaited work are caught, and 999,950 tokens and up read as 1M.
+- .claude-plugin/plugin.json: version 0.4.2.
 - README.md and the tests describe and cover the above.
 
 Every file in this folder is under the Apache License, Version 2.0 (see

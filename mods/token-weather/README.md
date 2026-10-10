@@ -37,7 +37,7 @@ Where each figure comes from:
 
 | Hook | What it does |
 |------|--------------|
-| `session.start` | Reads the window, the auto-compaction point and the starting estimate, starts a 30-second tick (countdowns, refreshes) and a half-second watch (which chat is on screen, and whether the engine has dropped its context figure), and draws the last kept limits reading while its `/usage` read runs alongside the engine's own start. |
+| `session.start` | Reads the window, the auto-compaction point and the starting estimate, starts a 30-second tick (countdowns, refreshes) and a half-second watch (which chat is on screen, and whether the engine has dropped its context figure or lowered it with no measure, as a rewind does), and draws the last kept limits reading while its `/usage` read runs alongside the engine's own start. |
 | `session.end` | On `/clear` and `/resume`, drops the ending chat's figures at once: the process goes on into another chat with no `session.start`. |
 | `turn.step` | Reads each main-loop response's usage as it finishes. Subagents' requests have their own windows and are skipped. |
 | `session.compact` | Puts the context row right after a compaction of the main conversation, which no measurement follows. |
@@ -69,7 +69,7 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
 
 ## How it was built
 
-- **Model:** built with Claude in Claude Code. Version 0.1.0 was tested with Claude Haiku 4.5. Versions 0.2.0 to 0.4.1 were built with Claude Opus 5.5 and tested live with Claude Haiku 5.5. The mod itself doesn't call a model.
+- **Model:** built with Claude in Claude Code. Version 0.1.0 was tested with Claude Haiku 4.5. Versions 0.2.0 to 0.4.2 were built with Claude Opus 5.5 and tested live with Claude Haiku 5.5. The mod itself doesn't call a model.
 - **Prompt(s):** the mod started as one of ten ideas Claude wrote for mods. This is the idea as written:
 
   > **Token Weather.** _A live forecast of your context window._ A band above the prompt draws a small chart of context use for each turn, as weather icons. It's clear when the window is mostly empty, and stormy when it's nearly full. It uses `ui.render` on the `AbovePrompt` component, with the `Svg` element, and it updates on `turn.complete`. I haven't confirmed which event or call gives the token counts, so that needs a check. Developers would share it because it looks good in a screenshot, and it answers "why did Claude forget that?" at a glance. The status line only shows text. _A weekend build._
@@ -85,24 +85,33 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
   Version 0.4.0 came from a request to remove the draft count, and to fix cached and uncached counts that seemed to come from another chat when a new or empty one was opened.
 
   Version 0.4.1 came from a request to fix the limit rows being empty for about a second after launch, while the context row was already drawn.
+
+  Version 0.4.2 came from a request to have a code-review agent review the whole project, especially terminal rendering, initialization and cleanup, and to fix every confirmed problem.
 - **Transcript:** not shared.
 - **Iterations:**
   - 0.1.0 read `$.session.usage()` once per turn, in `turn.complete`. 0.2.0 reads each response's usage in `turn.step`, so a long turn of tool calls moves the band request by request.
   - `$.session.usage()` has no rate-limit readings until the session's first response, so the limit rows would have been empty at start. `/usage` reads `GET /api/oauth/usage`; `$.session.authorize()` and `$.http.fetch` send the same request with the session's credential, which the engine adds itself.
   - The rate-limit headers are read as a request is answered and lag its own cost: in testing the band read 16% while `/usage` read 17%. The band now reads `/usage` again after each turn.
   - The same reset comes back as `14:09:59.95` from one read and `14:10:00` from the next, so the shown time rounds to the nearest minute.
-  - 0.1.0 avoided emoji because they weren't in its test terminal's font. 0.2.0 uses only emoji that are drawn as emoji by default (no variation selector), which emoji-capable terminals draw two cells wide.
+  - 0.1.0 avoided emoji because they weren't in its test terminal's font. 0.2.0 uses only emoji that are drawn as emoji by default (no variation selector), which emoji-capable terminals draw two cells wide (since 0.3.0 the icons outside the emoji block carry U+FE0F; see below).
   - 0.1.0 read `e.hasSurvey` and `e.bodyColumns`, which live under `e.props`: it never gave way to a survey and always laid out for 80 columns. Fixed.
   - 0.3.0 replaced the turn summary and the request chart with the cached and uncached split, and filled the row before the first response with Claude Code's own estimate.
   - After `/compact` the row kept the old size until the session was reopened: Claude Code sends no measurement after a compaction, and its own figure keeps the old size for a few seconds. 0.3.0 hooks `session.compact`. Of the estimates available, the summary breakdown was 21% over in testing and the `full` breakdown 30% under; the before/after count was 3% under the next request, which also carries the new prompt and reminders.
   - In Ghostty with JetBrainsMono Nerd Font, ⚡ sat a little to the left of the other icons: the font has its own one-cell ⚡, which Ghostty used instead of the emoji (`ghostty +show-face --cp=0x26A1`). Every icon outside the emoji block now carries U+FE0F, which asks for the emoji glyph in any terminal that honours it.
+  - 0.3.0 was tested with `claude plugin test` (17 tests, each new one checked to fail when its behavior is broken), `tsc`, and live in Claude Code 2.1.296 through a pseudo-terminal: the split matched `/context` (43.8k), and `/compact` moved the row within a second.
   - 0.4.0 removed the draft count. The figures had leaked from chat to chat: `session.start` fires once per process, and `/clear` and `/resume` switch chats inside it. After a `/resume` the band went on showing the last chat's figures, split included, until the next response (reproduced live); for the first moment after a `/clear` or `/resume` it showed them too, as Claude Code takes the new chat's id a beat after the screen changes. The figures now belong to the session id they were measured in: `session.end` drops them, a draw for another id shows none, and a half-second watch reads the new chat's own.
   - In a new chat the first response does report thousands of tokens read from the cache (26.8k of 43k in testing): the system prompt and tools are the same in every chat, so the API serves them from the cache another chat wrote. They are this chat's own context; `/context` shows the same total.
   - 0.4.0 was tested with `claude plugin test` (17 tests), `tsc`, and live: a fresh chat, `/clear`, `/resume` both ways, `/compact`, and a chat opened with `--resume`. At every switch the row went to `estimating…` and then to that chat's figure within 0.7 seconds, and after each response it matched `/context` (44.3k, 43k, 52.5k, 46.3k).
   - In 0.4.0 the limit rows waited at launch for `/usage`, which answered in 0.2–0.5 seconds in testing (cold connection included) and was only asked once the engine had started; the engine's own first rate-limit headers came 0.7–1.5 seconds after the start. Nothing local held a reading. 0.4.1 keeps every reading in the mod's store and starts the next session on it, and asks `/usage` alongside the engine's start (72 ms in rather than after it).
   - The headers ran a point under `/usage` (78% against 79% weekly, 6% against 7% 5-hour), so the weekly row went 79% → 78% in the first two seconds. A window's use only grows until it resets, so within one window the band keeps the higher figure.
   - 0.4.1 was tested with `claude plugin test` (21 tests, each new guard checked to fail when broken), `tsc`, and live: fresh processes in a pseudo-terminal, with and without a kept reading, and with `/usage` answering 429.
-  - 0.3.0 was tested with `claude plugin test` (17 tests, each new one checked to fail when its behavior is broken), `tsc`, and live in Claude Code 2.1.296 through a pseudo-terminal: the split matched `/context` (43.8k), and `/compact` moved the row within a second.
+  - 0.4.2 fixes what three rounds of review found. Every fix the test kit can observe has a test that fails without it (40 tests); the redraw after the start and the guards on unawaited work can't be observed there.
+    - After `/compact`, if the messages couldn't be counted (or the count hung), the row stayed on `estimating…` until the next response; it now takes Claude Code's estimate once the engine drops the old size, or after 20 seconds of counting, and not while a count is still running (that would flash Claude Code's rougher figure just before the count's). A later measure that says the context didn't move no longer brings back the size from before.
+    - The context watch took a response the engine hadn't taken in yet for a rewind, and dropped the exact figure for an estimate; it now compares the engine's figure with its own last reading. A figure the engine lowers with no measure (a rewind) is followed, and so is any figure while none on hand is exact; one it raises above the exact figure is left to the step, which brings the split.
+    - Within one window the higher figure stood even when `/usage` itself said less; now only a header is kept from lowering `/usage`'s figure. The last response's headers ride along with every measure: they now count only when they moved, and a header of an older window is ignored.
+    - A window `/usage` stopped listing kept its old reading, and a passed reset made the band ask `/usage` every 30 seconds; it is now dropped and shown as none open. If `/usage` goes on listing a reset that has passed, the band asks once more, not every 30 seconds. A `/usage` read that never answered stopped all later reads; after a minute the next refresh can start a new one, and the old one's answer is then ignored. A `/login` after the start was never picked up; it is asked again with each refresh.
+    - A compaction's count went on to count another chat's messages after a `/resume`; it stops at the switch.
+    - The band now redraws as soon as the start has read the window, unawaited work can't fail unhandled, kept readings are checked for values no window has, and 999,950 tokens read as `1M`, not `1000k`.
 
 ## Run it
 
@@ -139,6 +148,7 @@ scripts/check.sh token-weather           # validate, test, type-check
 - **`/api/oauth/usage` is the endpoint Claude Code's own `/usage` reads, not a documented API**, and may change. If it does, the rows say they're unavailable and the header readings still fill them during turns.
 - **Only the 5-hour and the all-models weekly limit are shown.** `/usage`'s other rows (a Sonnet-only week, per-model weeks, usage credits) are not.
 - **A reading older than 15 minutes says how old it is**, for example when `/usage` can't be reached.
+- **A window `/usage` doesn't list shows as none open**, as `/usage` leaves it out too: a 5-hour window before the first use since its reset, for example.
 - **At launch the limit rows show the last kept reading** until `/usage` answers, about half a second. Use since then from another device or claude.ai shows when it does; a window that has reset since stays empty until then. The store isn't kept per account: after switching accounts the old account's reading shows for that half second.
 - **One band per session.** Another plugin that draws `AbovePrompt` competes for the same band.
 

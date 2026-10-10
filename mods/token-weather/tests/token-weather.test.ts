@@ -37,6 +37,7 @@ type World = {
   fetch?: () => HttpResponse | Promise<HttpResponse>
   id?: () => string
   store?: Record<string, unknown>
+  count?: (body: string | undefined) => HttpResponse | Promise<HttpResponse>
   messages?: () => unknown[]
 }
 
@@ -78,7 +79,7 @@ function world(on: On, w: World = {}) {
   on('http.fetch', async (_$, e) => {
     fetches.push(e.url)
     if (e.url === COUNT_URL) {
-      return { value: counter(e.init?.body) }
+      return { value: w.count ? await w.count(e.init?.body) : counter(e.init?.body) }
     }
     return { value: w.fetch ? await w.fetch() : ok(USAGE_BODY) }
   })
@@ -212,7 +213,7 @@ describe('limits', () => {
     await $.session.measure({
       context: { window: 200_000 },
       rateLimits: [
-        { kind: 'five_hour', percentUsed: 91.5, resetsAt: new Date(NOW + 30 * MINUTE).toISOString() },
+        { kind: 'five_hour', percentUsed: 91.5, resetsAt: new Date(NOW + 2 * HOUR + 30 * MINUTE).toISOString() },
         { kind: 'seven_day', percentUsed: 100 },
       ],
       changed: ['rateLimits'],
@@ -220,7 +221,7 @@ describe('limits', () => {
     const r = await rows(await $.ui.mount(band()))
     expect(r.fiveHour).toMatch(/^🌀 5-hour/)
     expect(r.fiveHour).toContain('91%')
-    expect(r.fiveHour).toContain('9% left · resets in 30m')
+    expect(r.fiveHour).toContain('9% left · resets in 2h 30m')
     expect(r.weekly).toMatch(/^⛔\uFE0F Weekly/)
     expect(r.weekly).toContain('0% left')
   })
@@ -265,21 +266,137 @@ describe('limits', () => {
     const { clock, fetches } = world(on, {
       fetch: () => {
         call += 1
-        return call === 1 ? ok(USAGE_BODY) : ok({ ...USAGE_BODY, five_hour: { utilization: 2, resets_at: new Date(NOW + 7 * HOUR).toISOString() } })
+        return call === 1
+          ? ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 40_000).toISOString() } })
+          : ok({ ...USAGE_BODY, five_hour: { utilization: 2, resets_at: new Date(NOW + 7 * HOUR).toISOString() } })
       },
     })
     await start($, clock)
-    // A reading just heard, of a window that has already reset.
+    await clock.advance(50_000)
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).fiveHour).toContain('97%  3% left · reset due, refreshing')
+    await clock.advance(10_000)
+    expect(fetches).toHaveLength(2)
+    expect((await rows(ui)).fiveHour).toContain('98% left')
+  })
+
+  test('/usage is believed when it lowers a figure within the same window', async ($, on) => {
+    let call = 0
+    const { clock } = world(on, {
+      fetch: () => (++call === 1 ? ok({ ...USAGE_BODY, seven_day: { ...USAGE_BODY.seven_day, utilization: 80 } }) : ok({ ...USAGE_BODY, seven_day: { ...USAGE_BODY.seven_day, utilization: 20 } })),
+    })
+    await start($, clock)
+    await clock.advance(6 * MINUTE)
+    expect((await rows(await $.ui.mount(band()))).weekly).toContain('20%  80% left')
+  })
+
+  test('an old window’s headers never replace a newer reading', async ($, on) => {
+    const { clock } = world(on)
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    // The last response's headers of a window that has since reset.
     await $.session.measure({
       context: { window: 200_000 },
       rateLimits: [{ kind: 'five_hour', percentUsed: 97, resetsAt: new Date(NOW - 1000).toISOString() }],
+      changed: ['context'],
+    })
+    expect((await rows(ui)).fiveHour).toContain('8%  92% left')
+    // And headers of a window that reset before the one /usage reported.
+    await $.session.measure({
+      context: { window: 200_000 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: 97, resetsAt: new Date(NOW + 30 * MINUTE).toISOString() }],
       changed: ['rateLimits'],
     })
-    const ui = await $.ui.mount(band())
-    expect((await rows(ui)).fiveHour).toContain('97%  3% left · reset due, refreshing')
-    await clock.advance(30_000)
+    expect((await rows(ui)).fiveHour).toContain('8%  92% left')
+  })
+
+  test('headers that only ride along with a measure don’t freshen an old reading', async ($, on) => {
+    let call = 0
+    const { clock } = world(on, {
+      fetch: () => {
+        if (++call === 1) return ok(USAGE_BODY)
+        throw new Error('offline')
+      },
+    })
+    await start($, clock)
+    await clock.advance(16 * MINUTE)
+    await $.session.measure({
+      context: { window: 200_000 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: 8, resetsAt: USAGE_BODY.five_hour.resets_at }],
+      changed: ['context'],
+    })
+    expect((await rows(await $.ui.mount(band()))).fiveHour).toMatch(/as of 1[56]m ago/)
+  })
+
+  test('a kept reading no window could have is not shown', async ($, on) => {
+    world(on, {
+      fetch: () => new Promise<HttpResponse>(() => {}),
+      store: { limits: { five_hour: { used: 1e21, resetsAt: NOW + HOUR, at: NOW }, seven_day: { used: 50, resetsAt: NOW + HOUR, at: NOW + HOUR } } },
+    })
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    const r = await rows(await $.ui.mount(band()))
+    expect(r.fiveHour).toContain('reading /usage…')
+    expect(r.weekly).toContain('reading /usage…')
+  })
+
+  test('a window /usage stops listing is dropped, and nothing refetches in a loop', async ($, on) => {
+    let call = 0
+    const { clock, fetches } = world(on, {
+      fetch: () => (++call === 1 ? ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 40_000).toISOString() } }) : ok({ ...USAGE_BODY, five_hour: null })),
+    })
+    await start($, clock)
+    await clock.advance(12 * MINUTE)
+    // Read at the start, at the reset, then every 5 minutes.
+    expect(fetches.length).toBeLessThanOrEqual(4)
+    const r = await rows(await $.ui.mount(band()))
+    expect(r.fiveHour).toContain('none open now')
+    expect(r.fiveHour).not.toContain('97%')
+    expect(r.weekly).toContain('66%')
+  })
+
+  test('a /usage that keeps listing a passed reset is not asked every 30 seconds', async ($, on) => {
+    const { clock, fetches } = world(on, {
+      fetch: () => ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 40_000).toISOString() } }),
+    })
+    await start($, clock)
+    await clock.advance(5 * MINUTE)
+    // The start's read, and one at the reset; the next is the 5-minute refresh.
     expect(fetches).toHaveLength(2)
-    expect((await rows(ui)).fiveHour).toContain('98% left')
+  })
+
+  test('a read given up on that answers late doesn’t overwrite a newer one', async ($, on) => {
+    let call = 0
+    let late: (r: HttpResponse) => void = () => {}
+    const { clock } = world(on, {
+      fetch: () => (++call === 1 ? new Promise<HttpResponse>(resolve => (late = resolve)) : ok(USAGE_BODY)),
+    })
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    await clock.advance(6 * MINUTE)
+    late(ok({ ...USAGE_BODY, five_hour: { ...USAGE_BODY.five_hour, utilization: 50 } }))
+    await clock.settle()
+    expect((await rows(await $.ui.mount(band()))).fiveHour).toContain('8%  92% left')
+  })
+
+  test('a /usage read that never answers is given up, and limits are read again', async ($, on) => {
+    let call = 0
+    const { clock, fetches } = world(on, {
+      fetch: () => (++call === 1 ? new Promise<HttpResponse>(() => {}) : ok(USAGE_BODY)),
+    })
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    await clock.advance(6 * MINUTE)
+    expect(fetches).toHaveLength(2)
+    expect((await rows(await $.ui.mount(band()))).fiveHour).toContain('92% left')
+  })
+
+  test('a claude.ai login after the start is picked up', async ($, on) => {
+    let isLoggedIn = false
+    const { clock } = world(on, { authorize: () => (isLoggedIn ? { handle: 'handle', kind: 'bearer' } : null) })
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).fiveHour).toContain('needs a claude.ai subscription login')
+    isLoggedIn = true
+    await clock.advance(6 * MINUTE)
+    expect((await rows(ui)).fiveHour).toContain('92% left')
   })
 
   test('reads /usage again once a turn has ended, at most every 30 seconds', async ($, on) => {
@@ -432,6 +549,223 @@ describe('context', () => {
     expect((await rows(ui)).context).toContain('50k / 200k · 49.5k cached')
   })
 
+  test('a response the engine hasn’t caught up with yet stays exact', async ($, on) => {
+    const { clock } = world(on)
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(18_000, 24_100) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(18_000, 24_100) }
+    })
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 1 })
+    await clock.advance(2_000)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('42.1k / 200k · 24.1k cached · 18k uncached')
+  })
+
+  test('the engine taking in the next request early leaves the split alone', async ($, on) => {
+    let tokens: number | undefined
+    const { clock } = world(on, {
+      usage: () => ({ startedAt: NOW, context: { window: 200_000, tokens, breakdown: { autoCompactThreshold: 160_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(18_000, 24_100) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(18_000, 24_100) }
+    })
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 1 })
+    tokens = 42_100
+    await clock.advance(500)
+    // The next request's input, before its step ends.
+    tokens = 60_000
+    await clock.advance(500)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('42.1k / 200k · 24.1k cached · 18k uncached')
+  })
+
+  test('a rewind the engine reports without a measure moves the row', async ($, on) => {
+    let tokens = 50_000
+    const { clock } = world(on, {
+      usage: () => ({ startedAt: NOW, context: { window: 200_000, tokens, breakdown: { autoCompactThreshold: 160_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    await start($, clock)
+    await clock.advance(500)
+    tokens = 30_000
+    await clock.advance(500)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('30k / 200k')
+  })
+
+  test('/compact with no count of the messages: Claude Code’s own estimate once the engine lets go', async ($, on) => {
+    let compacted = false
+    let engineTokens: number | undefined
+    const { clock } = world(on, {
+      messages: () => {
+        if (compacted) throw new Error('transcript unreadable')
+        return [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(30_000) }] }]
+      },
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 31_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    engineTokens = 50_000
+    await clock.advance(500)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    compacted = true
+    await clock.advance(2_000)
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).context).toContain('estimating…')
+    engineTokens = undefined
+    await clock.advance(500)
+    expect((await rows(ui)).context).toContain('~31k / 200k estimated')
+  })
+
+  test('/compact with the count still running when the engine lets go: no rough estimate in between', async ($, on) => {
+    let compacted = false
+    let engineTokens: number | undefined
+    let release: () => void = () => {}
+    const { clock } = world(on, {
+      messages: () => [{ role: 'user', content: [{ type: 'text', text: compacted ? 'summary '.repeat(500) : 'x'.repeat(30_000) }] }],
+      // The count of the messages after the compaction answers when released.
+      count: body => (body?.includes('summary') ? new Promise<HttpResponse>(resolve => (release = () => resolve(counter(body)))) : counter(body)),
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 99_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    engineTokens = 50_000
+    await clock.advance(500)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    compacted = true
+    await clock.advance(1_000)
+    engineTokens = undefined
+    await clock.advance(1_000)
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).context).toContain('estimating…')
+    release()
+    await clock.settle()
+    expect((await rows(ui)).context).toContain('~24.5k / 200k estimated')
+  })
+
+  test('/compact: a transcript that fails while still being read back, after the engine let go', async ($, on) => {
+    let compacted = false
+    let reads = 0
+    let engineTokens: number | undefined
+    const before = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(30_000) }] }]
+    const { clock } = world(on, {
+      messages: () => {
+        if (compacted && ++reads > 3) throw new Error('transcript unreadable')
+        return before
+      },
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 31_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    engineTokens = 50_000
+    await clock.advance(500)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    compacted = true
+    await clock.advance(1_000)
+    engineTokens = undefined
+    await clock.advance(3_000)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('~31k / 200k estimated')
+  })
+
+  test('/compact: a failed count read back between the engine letting go and the next watch', async ($, on) => {
+    let compacted = false
+    let engineTokens: number | undefined = 50_000
+    const { clock } = world(on, {
+      messages: () => [{ role: 'user', content: [{ type: 'text', text: compacted ? 'short' : 'x'.repeat(30_000) }] }],
+      count: () => ({ status: 500, ok: false, headers: {}, text: '' }),
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 31_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    // The compaction's poll runs a quarter-second off the watch's beat.
+    await clock.advance(250)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    compacted = true
+    await clock.advance(350) // the watch at 500 still hears 50k
+    engineTokens = undefined // let go at 600; the poll reads back at 750
+    await clock.advance(1_000)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('~31k / 200k estimated')
+  })
+
+  test('/compact: a count that never answers gives way to Claude Code’s estimate', async ($, on) => {
+    let compacted = false
+    let engineTokens: number | undefined
+    const { clock } = world(on, {
+      messages: () => [{ role: 'user', content: [{ type: 'text', text: compacted ? 'summary '.repeat(500) : 'x'.repeat(30_000) }] }],
+      count: body => (body?.includes('summary') ? new Promise<HttpResponse>(() => {}) : counter(body)),
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 31_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    engineTokens = 50_000
+    await clock.advance(500)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    compacted = true
+    await clock.advance(1_000)
+    engineTokens = undefined
+    await clock.advance(30_000)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('~31k / 200k estimated')
+  })
+
+  test('a measure that says the context didn’t move doesn’t bring back an old size', async ($, on) => {
+    let compacted = false
+    let engineTokens: number | undefined
+    const { clock } = world(on, {
+      messages: () => [{ role: 'user', content: [{ type: 'text', text: compacted ? 'summary '.repeat(500) : 'x'.repeat(30_000) }] }],
+      usage: () =>
+        ({ startedAt: NOW, context: { window: 200_000, tokens: engineTokens, breakdown: { autoCompactThreshold: 160_000, totalTokens: 31_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    on('turn.step', async function* (_$, e) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: usage(500, 49_500) }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage(500, 49_500) }
+    })
+    on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
+    await start($, clock)
+    await step($, { turnId: 't1', index: 0, model: 'claude-test', messageCount: 2 })
+    engineTokens = 50_000
+    await clock.advance(500)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'all of it', toolUses: [] }] })
+    compacted = true
+    await clock.advance(1_000)
+    engineTokens = undefined
+    await clock.advance(1_000)
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).context).toContain('~24.5k / 200k estimated')
+    // A late measure still carrying the size from before the compaction.
+    await $.session.measure({ context: { window: 200_000, tokens: 50_000 }, rateLimits: [], changed: ['cost'] })
+    await clock.advance(1_000)
+    expect((await rows(ui)).context).toContain('~24.5k / 200k estimated')
+  })
+
   test('a rewind or the end of a compaction: when the engine lets go of its figure, so does the row', async ($, on) => {
     let tokens: number | undefined = 30_000
     const { clock } = world(on, {
@@ -497,7 +831,7 @@ describe('context', () => {
   test('a compaction that ends after a switch leaves the new chat alone', async ($, on) => {
     let chat = 'A'
     let compacted = false
-    const { clock } = world(on, {
+    const { clock, fetches } = world(on, {
       id: () => chat,
       messages: () => [{ role: 'user', content: [{ type: 'text', text: compacted ? 'short' : 'x'.repeat(30_000) }] }],
       usage: () =>
@@ -515,10 +849,20 @@ describe('context', () => {
     compacted = true
     await clock.advance(2_000)
     expect((await rows(await $.ui.mount(band()))).context).toContain('~41k / 200k estimated')
+    // The other chat's messages were never sent to be counted: only chat A's, before.
+    expect(fetches.filter(url => url.endsWith('/count_tokens'))).toHaveLength(1)
   })
 })
 
 describe('layout', () => {
+  test('a figure that rounds to 1000k is shown as 1M', async ($, on) => {
+    const { clock } = world(on, {
+      usage: () => ({ startedAt: NOW, context: { window: 1_000_000, tokens: 999_960 }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    await start($, clock)
+    expect((await rows(await $.ui.mount(band()))).context).toContain('1M / 1M')
+  })
+
   test('folds into one line where the band has fewer than three rows', async ($, on) => {
     const { clock } = world(on)
     await start($, clock)
