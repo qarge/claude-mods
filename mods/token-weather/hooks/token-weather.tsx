@@ -50,13 +50,22 @@ const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 // own one-cell ⚡ (JetBrains Mono, Nerd Fonts) otherwise draws that, left in
 // the two cells the icon takes.
 const SKY = [
-  { below: 25, icon: '🌞', color: 'success' },
+  { below: 25, icon: '🌞', color: 'success', shade: 0 },
   { below: 50, icon: '⛅\uFE0F', color: 'success' },
   { below: 75, icon: '☔\uFE0F', color: 'warning' },
-  { below: 90, icon: '⚡\uFE0F', color: 'warning' },
+  { below: 90, icon: '⚡\uFE0F', color: 'warning', shade: 1 },
   { below: 100, icon: '🌀', color: 'error' },
-  { below: Infinity, icon: '⛔\uFE0F', color: 'error' },
+  { below: Infinity, icon: '⛔\uFE0F', color: 'error', shade: 2 },
 ] as const
+// The shaded levels: a lighter green, a darker orange and a darker red than
+// the theme's own, made from the colours of the built-in dark and light
+// themes (dark: rgb(78,186,101), rgb(255,193,7), rgb(255,107,128); light:
+// rgb(44,122,57), rgb(150,108,30), rgb(171,43,63)). Any other theme keeps
+// its own colour at those levels.
+const SHADES: Record<string, readonly string[]> = {
+  dark: ['rgb(134,224,151)', 'rgb(245,140,20)', 'rgb(200,45,65)'],
+  light: ['rgb(96,176,108)', 'rgb(115,72,10)', 'rgb(125,20,40)'],
+}
 type Sky = { icon: string; color?: string }
 const WAITING: Sky = { icon: '⏳\uFE0F' }
 const UNKNOWN: Sky = { icon: '❔\uFE0F' }
@@ -90,6 +99,7 @@ let watcher: Timer | undefined
 let isWatching = false
 let isCounting = false // a compaction's messages are being counted
 let heard: number | undefined // the engine's context figure, as last read
+let theme: string | undefined // the /config theme, which picks the shades
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -103,7 +113,7 @@ export const register: Register = on => {
     const result = await next(e)
     session = await $.session.id()
     ctx = {}
-    await readUsage($)
+    await Promise.all([readUsage($), readTheme($)])
     $.ui.invalidate('ui.render') // the band can draw now that the window is known
     ticker?.cancel()
     ticker = $.clock.every(TICK_MS, () => void tick($).catch(() => {}))
@@ -191,6 +201,13 @@ export const register: Register = on => {
     return result
   })
 
+  on('config.set', { key: 'theme' }, async ($, e, next) => {
+    const result = await next(e)
+    await readTheme($)
+    $.ui.invalidate('ui.render')
+    return result
+  })
+
   on('turn.complete', ($, e, next) => {
     if (!e.agentId) {
       hasTurnEnded = true // the next tick reads /usage as the turn settled it
@@ -261,6 +278,14 @@ async function readUsage($: EngineInterface) {
     }
   } catch {
     // The band keeps what it had.
+  }
+}
+
+async function readTheme($: EngineInterface) {
+  try {
+    theme = String((await $.config.list()).find(row => row.key === 'theme')?.value)
+  } catch {
+    theme = undefined // the theme's own colours
   }
 }
 
@@ -562,7 +587,9 @@ function limitRow(label: string, limit: Limit | undefined, now: number, columns:
 }
 
 function skyFor(percent: number): Sky {
-  return SKY.find(s => percent < s.below) ?? SKY[SKY.length - 1]!
+  const sky = SKY.find(s => percent < s.below) ?? SKY[SKY.length - 1]!
+  const shade = 'shade' in sky && theme !== undefined ? SHADES[theme]?.[sky.shade] : undefined
+  return { icon: sky.icon, color: shade ?? sky.color }
 }
 
 // The filled part of a bar `width` cells wide, to an eighth of a cell.

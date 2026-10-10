@@ -86,5 +86,13 @@ Changes by qarge, 2026-10-10 (version 0.4.2), after a code review:
 - .claude-plugin/plugin.json: version 0.4.2.
 - README.md and the tests describe and cover the above.
 
+Changes by qarge, 2026-10-10 (version 0.4.3):
+
+- hooks/token-weather.tsx: under 25% a lighter green, at 75–89% a darker
+  orange and from 100% a darker red than the theme's own, for the dark and
+  light themes (read from /config, and followed when it changes there).
+- .claude-plugin/plugin.json: version 0.4.3.
+- README.md and the tests describe and cover the above.
+
 Every file in this folder is under the Apache License, Version 2.0 (see
 LICENSE), including the files qarge wrote for it.

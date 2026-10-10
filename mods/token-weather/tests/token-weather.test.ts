@@ -38,6 +38,7 @@ type World = {
   id?: () => string
   store?: Record<string, unknown>
   count?: (body: string | undefined) => HttpResponse | Promise<HttpResponse>
+  theme?: () => string
   messages?: () => unknown[]
 }
 
@@ -86,6 +87,8 @@ function world(on: On, w: World = {}) {
   on('session.model', () => ({ value: 'claude-test' }))
   on('session.id', () => ({ value: w.id?.() ?? 'chat' }))
   on('session.messages', () => ({ value: (w.messages?.() ?? []) as never }))
+  on('config.list', () => ({ value: [{ key: 'theme', value: w.theme?.() ?? 'dark' }] as never }))
+  on('config.set', (_$, e) => ({ value: e.value }))
   return { clock, fetches, store }
 }
 
@@ -851,6 +854,53 @@ describe('context', () => {
     expect((await rows(await $.ui.mount(band()))).context).toContain('~41k / 200k estimated')
     // The other chat's messages were never sent to be counted: only chat A's, before.
     expect(fetches.filter(url => url.endsWith('/count_tokens'))).toHaveLength(1)
+  })
+})
+
+describe('colors', () => {
+  // Each row's bar, in row order: the Text that holds its filled cells.
+  async function barColors(ui: { findAll: (q: { type: string; text: RegExp }) => Promise<{ props: Record<string, unknown> }[]> }) {
+    return (await ui.findAll({ type: 'Text', text: /^[█▏▎▍▌▋▊▉]+$/ })).map(t => t.props.color)
+  }
+  // Context 10%, 5-hour 80%, weekly 100%.
+  function figures(on: On, theme: () => string) {
+    return world(on, {
+      theme,
+      fetch: () =>
+        ok({ five_hour: { ...USAGE_BODY.five_hour, utilization: 80 }, seven_day: { ...USAGE_BODY.seven_day, utilization: 100 } }),
+      usage: () => ({ startedAt: NOW, context: { window: 200_000, tokens: 20_000, breakdown: { autoCompactThreshold: 160_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+  }
+
+  test('under 25% a lighter green, 75–89% a darker orange, from 100% a darker red', async ($, on) => {
+    const { clock } = figures(on, () => 'dark')
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    expect(await barColors(ui)).toEqual(['rgb(134,224,151)', 'rgb(245,140,20)', 'rgb(200,45,65)'])
+    // The percent takes its bar's color.
+    expect((await ui.find({ key: 'Weekly' }))?.text).toContain('100%')
+    expect((await ui.findAll({ type: 'Text', text: /^ *100%$/ }))[0]?.props.color).toBe('rgb(200,45,65)')
+  })
+
+  test('between those, the theme’s own green, orange and red', async ($, on) => {
+    const { clock } = world(on, {
+      fetch: () => ok({ five_hour: { ...USAGE_BODY.five_hour, utilization: 60 }, seven_day: { ...USAGE_BODY.seven_day, utilization: 95 } }),
+      usage: () => ({ startedAt: NOW, context: { window: 200_000, tokens: 60_000, breakdown: { autoCompactThreshold: 160_000 } }, rateLimits: [] }) as unknown as SessionUsage,
+    })
+    await start($, clock)
+    expect(await barColors(await $.ui.mount(band()))).toEqual(['success', 'warning', 'error'])
+  })
+
+  test('the light theme gets shades of its own, and any other theme keeps its colors', async ($, on) => {
+    let theme = 'light'
+    const { clock } = figures(on, () => theme)
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    expect(await barColors(ui)).toEqual(['rgb(96,176,108)', 'rgb(115,72,10)', 'rgb(125,20,40)'])
+    // Changed in /config, the band follows.
+    theme = 'dark-daltonized'
+    await $.config.set({ key: 'theme', value: 'dark-daltonized', previous: 'light', provider: { plugin: 'engine', tier: 'core' }, origin: { kind: 'composer' } })
+    expect(await barColors(ui)).toEqual(['success', 'warning', 'error'])
   })
 })
 

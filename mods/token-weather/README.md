@@ -11,14 +11,16 @@ Three rows above the prompt, each with a weather icon, a bar, the percentage use
 
 One scale for all three rows, by percent used:
 
-| Used      | Icon | Color |
-|-----------|------|-------|
-| under 25% | 🌞   | green |
-| 25–49%    | ⛅   | green |
-| 50–74%    | ☔   | amber |
-| 75–89%    | ⚡   | amber |
-| 90–99%    | 🌀   | red   |
-| 100% up   | ⛔   | red   |
+| Used      | Icon | Color         |
+|-----------|------|---------------|
+| under 25% | 🌞   | lighter green |
+| 25–49%    | ⛅   | green         |
+| 50–74%    | ☔   | amber         |
+| 75–89%    | ⚡   | darker orange |
+| 90–99%    | 🌀   | red           |
+| 100% up   | ⛔   | darker red    |
+
+Green, amber and red are your theme's own. The lighter and darker shades are made from the colors of Claude Code's built-in dark and light themes; under any other theme (the colorblind-friendly and ANSI ones, for example) those levels keep the theme's own color. Each row's percentage takes its bar's color.
 
 For the context row the icon counts toward the auto-compaction point, where the window effectively ends; the percentage is of the whole window, as the status line and `/context` show it.
 
@@ -69,7 +71,7 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
 
 ## How it was built
 
-- **Model:** built with Claude in Claude Code. Version 0.1.0 was tested with Claude Haiku 4.5. Versions 0.2.0 to 0.4.2 were built with Claude Opus 5.5 and tested live with Claude Haiku 5.5. The mod itself doesn't call a model.
+- **Model:** built with Claude in Claude Code. Version 0.1.0 was tested with Claude Haiku 4.5. Versions 0.2.0 to 0.4.3 were built with Claude Opus 5.5 and tested live with Claude Haiku 5.5. The mod itself doesn't call a model.
 - **Prompt(s):** the mod started as one of ten ideas Claude wrote for mods. This is the idea as written:
 
   > **Token Weather.** _A live forecast of your context window._ A band above the prompt draws a small chart of context use for each turn, as weather icons. It's clear when the window is mostly empty, and stormy when it's nearly full. It uses `ui.render` on the `AbovePrompt` component, with the `Svg` element, and it updates on `turn.complete`. I haven't confirmed which event or call gives the token counts, so that needs a check. Developers would share it because it looks good in a screenshot, and it answers "why did Claude forget that?" at a glance. The status line only shows text. _A weekend build._
@@ -87,6 +89,8 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
   Version 0.4.1 came from a request to fix the limit rows being empty for about a second after launch, while the context row was already drawn.
 
   Version 0.4.2 came from a request to have a code-review agent review the whole project, especially terminal rendering, initialization and cleanup, and to fix every confirmed problem.
+
+  Version 0.4.3 came from a request to make the bar under 25% a lighter green than at 25–49%, the bar at 75–89% a darker orange than at 50–74%, and the bar at 100% a darker red.
 - **Transcript:** not shared.
 - **Iterations:**
   - 0.1.0 read `$.session.usage()` once per turn, in `turn.complete`. 0.2.0 reads each response's usage in `turn.step`, so a long turn of tool calls moves the band request by request.
@@ -112,6 +116,7 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
     - A window `/usage` stopped listing kept its old reading, and a passed reset made the band ask `/usage` every 30 seconds; it is now dropped and shown as none open. If `/usage` goes on listing a reset that has passed, the band asks once more, not every 30 seconds. A `/usage` read that never answered stopped all later reads; after a minute the next refresh can start a new one, and the old one's answer is then ignored. A `/login` after the start was never picked up; it is asked again with each refresh.
     - A compaction's count went on to count another chat's messages after a `/resume`; it stops at the switch.
     - The band now redraws as soon as the start has read the window, unawaited work can't fail unhandled, kept readings are checked for values no window has, and 999,950 tokens read as `1M`, not `1000k`.
+  - 0.4.3 was tested with `claude plugin test` (43 tests: the shades under the dark and light themes, the theme's own colors in between and under other themes, and a theme change in `/config`) and live: the terminal received the lighter green for a 4% context bar and the darker orange for limit bars at 80% and 88%.
 
 ## Run it
 
