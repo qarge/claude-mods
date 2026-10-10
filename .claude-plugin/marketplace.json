@@ -1,0 +1,16 @@
+{
+  "name": "qarge-mods",
+  "owner": {
+    "name": "qarge"
+  },
+  "metadata": {
+    "description": "Claude Code mods by qarge. Install each one on its own."
+  },
+  "plugins": [
+    {
+      "name": "token-weather",
+      "source": "./mods/token-weather",
+      "description": "A live forecast above the prompt: context window fill and the 5-hour and weekly usage limits."
+    }
+  ]
+}

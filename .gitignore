@@ -1,0 +1,4 @@
+# Claude Code lays each mod's API types here when it loads the mod from its folder.
+**/.claude-plugin/types/
+node_modules/
+.DS_Store
