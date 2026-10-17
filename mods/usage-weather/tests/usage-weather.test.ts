@@ -28,7 +28,7 @@ const PROPS: RenderPropsOf['AbovePrompt'] = {
 }
 
 function band(props: Partial<RenderPropsOf['AbovePrompt']> = {}, surface: 'terminal' | 'desktop' = 'terminal') {
-  return { plugin: 'token-weather', surface, component: 'AbovePrompt' as const, props: { ...PROPS, ...props } }
+  return { plugin: 'usage-weather', surface, component: 'AbovePrompt' as const, props: { ...PROPS, ...props } }
 }
 
 type World = {
@@ -246,7 +246,7 @@ describe('limits', () => {
     expect((await rows(ui)).fiveHour).toContain(`(${shown})`)
   })
 
-  test('refetches every few minutes while idle', async ($, on) => {
+  test('refetches every minute while idle', async ($, on) => {
     let call = 0
     const { clock, fetches } = world(on, {
       fetch: () => {
@@ -255,9 +255,9 @@ describe('limits', () => {
       },
     })
     await start($, clock)
-    await clock.advance(4 * MINUTE)
+    await clock.advance(50_000)
     expect(fetches).toHaveLength(1)
-    await clock.advance(2 * MINUTE)
+    await clock.advance(10_000)
     expect(fetches).toHaveLength(2)
     const r = await rows(await $.ui.mount(band()))
     expect(r.fiveHour).toContain('2%')
@@ -270,15 +270,15 @@ describe('limits', () => {
       fetch: () => {
         call += 1
         return call === 1
-          ? ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 40_000).toISOString() } })
+          ? ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 10_000).toISOString() } })
           : ok({ ...USAGE_BODY, five_hour: { utilization: 2, resets_at: new Date(NOW + 7 * HOUR).toISOString() } })
       },
     })
     await start($, clock)
-    await clock.advance(50_000)
+    await clock.advance(20_000)
     const ui = await $.ui.mount(band())
     expect((await rows(ui)).fiveHour).toContain('97%  3% left · reset due, refreshing')
-    await clock.advance(10_000)
+    await clock.advance(10_000) // the next tick, half a minute before the refresh would be due
     expect(fetches).toHaveLength(2)
     expect((await rows(ui)).fiveHour).toContain('98% left')
   })
@@ -345,12 +345,12 @@ describe('limits', () => {
   test('a window /usage stops listing is dropped, and nothing refetches in a loop', async ($, on) => {
     let call = 0
     const { clock, fetches } = world(on, {
-      fetch: () => (++call === 1 ? ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 40_000).toISOString() } }) : ok({ ...USAGE_BODY, five_hour: null })),
+      fetch: () => (++call === 1 ? ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 10_000).toISOString() } }) : ok({ ...USAGE_BODY, five_hour: null })),
     })
     await start($, clock)
-    await clock.advance(12 * MINUTE)
-    // Read at the start, at the reset, then every 5 minutes.
-    expect(fetches.length).toBeLessThanOrEqual(4)
+    await clock.advance(2 * MINUTE)
+    // Read at the start, at the reset (30 s), then a minute after that.
+    expect(fetches).toHaveLength(3)
     const r = await rows(await $.ui.mount(band()))
     expect(r.fiveHour).toContain('none open now')
     expect(r.fiveHour).not.toContain('97%')
@@ -359,11 +359,11 @@ describe('limits', () => {
 
   test('a /usage that keeps listing a passed reset is not asked every 30 seconds', async ($, on) => {
     const { clock, fetches } = world(on, {
-      fetch: () => ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 40_000).toISOString() } }),
+      fetch: () => ok({ ...USAGE_BODY, five_hour: { utilization: 97, resets_at: new Date(NOW + 10_000).toISOString() } }),
     })
     await start($, clock)
-    await clock.advance(5 * MINUTE)
-    // The start's read, and one at the reset; the next is the 5-minute refresh.
+    await clock.advance(MINUTE)
+    // The start's read, and one at the reset (30 s); the next is the refresh, a minute after that.
     expect(fetches).toHaveLength(2)
   })
 
@@ -386,7 +386,7 @@ describe('limits', () => {
       fetch: () => (++call === 1 ? new Promise<HttpResponse>(() => {}) : ok(USAGE_BODY)),
     })
     await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
-    await clock.advance(6 * MINUTE)
+    await clock.advance(MINUTE)
     expect(fetches).toHaveLength(2)
     expect((await rows(await $.ui.mount(band()))).fiveHour).toContain('92% left')
   })
@@ -406,16 +406,15 @@ describe('limits', () => {
     const { clock, fetches } = world(on)
     on('turn.complete', () => ({ text: 'done' }))
     await start($, clock)
-    const turnEnd = { reason: 'answer', text: 'done', turnId: 't1', isAborted: false } as never
+    const turnEnd = { reason: 'answer', answer: 'done', durationMs: 1_000, turnId: 't1', isAborted: false } as const
     await $.turn.complete(turnEnd)
     await clock.advance(10_000)
     expect(fetches).toHaveLength(1) // the start's read is too recent
     await clock.advance(20_000)
     expect(fetches).toHaveLength(2)
-    await clock.advance(60_000)
-    expect(fetches).toHaveLength(2) // no turn ended since: nothing to read
-    // A subagent's turn is not the session's.
-    await $.turn.complete({ ...(turnEnd as object), agentId: 'a1' } as never)
+    // A subagent's turn is not the session's, and none of its own has ended
+    // since: the next tick, before the refresh is due, reads nothing.
+    await $.turn.complete({ ...turnEnd, agentId: 'a1' })
     await clock.advance(30_000)
     expect(fetches).toHaveLength(2)
   })
@@ -441,8 +440,8 @@ describe('limits', () => {
     const ui = await $.ui.mount(band())
     expect((await rows(ui)).fiveHour).toContain('unavailable: /usage answered HTTP 503')
     await clock.advance(MINUTE)
-    expect(fetches).toHaveLength(1)
-    await clock.advance(5 * MINUTE)
+    expect(fetches).toHaveLength(1) // a 5xx waits two minutes
+    await clock.advance(MINUTE)
     expect(fetches).toHaveLength(2)
     expect((await rows(ui)).fiveHour).toContain('92% left')
   })
@@ -461,6 +460,67 @@ describe('limits', () => {
     expect((await rows(ui)).weekly).toContain('unavailable: /usage could not be read')
     await clock.advance(6 * MINUTE)
     expect((await rows(ui)).weekly).toContain('unavailable: /usage could not be read')
+  })
+
+  test('what another session kept shows within half a second', async ($, on) => {
+    const { clock, store, fetches } = world(on)
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    expect((await rows(ui)).fiveHour).toContain('8%  92% left')
+    // Another session's response headers, kept a second later.
+    await clock.advance(1_000)
+    const at = NOW + 1_000
+    store.limits = { five_hour: { used: 41, resetsAt: NOW + 2 * HOUR, at }, seven_day: { used: 70, resetsAt: NOW + 44 * HOUR, at }, at }
+    await clock.advance(500)
+    let r = await rows(ui)
+    expect(r.fiveHour).toContain('41%  59% left')
+    expect(r.weekly).toContain('70%  30% left')
+    // An older record is not taken.
+    store.limits = { five_hour: { used: 3, resetsAt: NOW + 2 * HOUR, at }, at: NOW }
+    await clock.advance(500)
+    r = await rows(ui)
+    expect(r.fiveHour).toContain('41%  59% left')
+    expect(fetches).toHaveLength(1)
+  })
+
+  test('a /usage read by another session spares this one its own', async ($, on) => {
+    const { clock, store, fetches } = world(on)
+    await start($, clock)
+    await clock.advance(50_000)
+    const at = NOW + 50_000
+    store.limits = { five_hour: { used: 9, resetsAt: NOW + 2 * HOUR, at }, seven_day: { used: 67, resetsAt: NOW + 44 * HOUR, at }, at }
+    await clock.advance(40_000)
+    // The refresh is due a minute after the newest reading any session heard.
+    expect(fetches).toHaveLength(1)
+    await clock.advance(30_000)
+    expect(fetches).toHaveLength(2)
+  })
+
+  test('what this session hears is kept on top of what another kept meanwhile', async ($, on) => {
+    const { clock, store } = world(on)
+    await start($, clock)
+    await clock.advance(250) // between two syncs
+    const at = NOW + 250
+    store.limits = { five_hour: { used: 41, resetsAt: NOW + 2 * HOUR, at }, seven_day: { used: 66.4, resetsAt: Date.parse(USAGE_BODY.seven_day.resets_at), at }, at }
+    await $.session.measure({
+      context: { window: 200_000 },
+      rateLimits: [{ kind: 'seven_day', percentUsed: 68, resetsAt: USAGE_BODY.seven_day.resets_at }],
+      changed: ['rateLimits'],
+    })
+    const kept = JSON.parse(JSON.stringify(store.limits)) as { five_hour: { used: number }; seven_day: { used: number }; at: number }
+    expect(kept.five_hour.used).toBe(41)
+    expect(kept.seven_day.used).toBe(68)
+    expect(kept.at).toBeGreaterThan(at)
+  })
+
+  test('a session with no subscription login takes no other session’s limits', async ($, on) => {
+    const { clock, store } = world(on, { authorize: () => ({ handle: 'key', kind: 'api-key' }) })
+    await start($, clock)
+    await clock.advance(1_000)
+    const at = NOW + 1_000
+    store.limits = { five_hour: { used: 41, resetsAt: NOW + 2 * HOUR, at }, at }
+    await clock.advance(500)
+    expect((await rows(await $.ui.mount(band()))).fiveHour).toContain('unavailable: needs a claude.ai subscription login')
   })
 
   test('an old reading says how old it is', async ($, on) => {
@@ -882,13 +942,40 @@ describe('colors', () => {
     expect((await ui.findAll({ type: 'Text', text: /^ *100%$/ }))[0]?.props.color).toBe('rgb(200,45,65)')
   })
 
-  test('between those, the theme’s own green, orange and red', async ($, on) => {
+  test('inside their levels, the theme’s own green, amber and red', async ($, on) => {
     const { clock } = world(on, {
-      fetch: () => ok({ five_hour: { ...USAGE_BODY.five_hour, utilization: 60 }, seven_day: { ...USAGE_BODY.seven_day, utilization: 95 } }),
+      fetch: () => ok({ five_hour: { ...USAGE_BODY.five_hour, utilization: 62.5 }, seven_day: { ...USAGE_BODY.seven_day, utilization: 90 } }),
       usage: () => ({ startedAt: NOW, context: { window: 200_000, tokens: 60_000, breakdown: { autoCompactThreshold: 160_000 } }, rateLimits: [] }) as unknown as SessionUsage,
     })
     await start($, clock)
-    expect(await barColors(await $.ui.mount(band()))).toEqual(['success', 'warning', 'error'])
+    expect(await barColors(await $.ui.mount(band()))).toEqual(['rgb(78,186,101)', 'rgb(255,193,7)', 'rgb(255,107,128)'])
+  })
+
+  test('the color glides from level to level, with no step to see', async ($, on) => {
+    const { clock } = world(on, { fetch: () => ok({ ...USAGE_BODY, seven_day: { ...USAGE_BODY.seven_day, utilization: 1 } }) })
+    await start($, clock)
+    const ui = await $.ui.mount(band())
+    const channels = async () => {
+      return String((await barColors(ui))[2]).match(/\d+/g)!.map(Number)
+    }
+    let was = await channels()
+    let largest = 0
+    // Weekly from 1% (the first eighth of a cell) to 110%, a tenth of a point at a time.
+    for (let tenths = 11; tenths <= 1100; tenths++) {
+      await $.session.measure({
+        context: { window: 200_000 },
+        rateLimits: [{ kind: 'seven_day', percentUsed: tenths / 10, resetsAt: USAGE_BODY.seven_day.resets_at }],
+        changed: ['rateLimits'],
+      })
+      const now = await channels()
+      largest = Math.max(largest, ...now.map((c, k) => Math.abs(c - was[k]!)))
+      was = now
+    }
+    // One level's color was 53 to 177 from the next's in some channel; a
+    // tenth of a point now moves a channel by 3 at most.
+    expect(largest).toBeGreaterThan(0)
+    expect(largest).toBeLessThanOrEqual(3)
+    expect(was).toEqual([200, 45, 65])
   })
 
   test('the light theme gets shades of its own, and any other theme keeps its colors', async ($, on) => {

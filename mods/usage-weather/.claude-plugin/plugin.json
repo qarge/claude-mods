@@ -1,0 +1,10 @@
+{
+  "name": "usage-weather",
+  "version": "0.5.0",
+  "description": "A live forecast above the prompt: context window fill (cached and uncached) updated on every model request, and the 5-hour and weekly usage limits as /usage reports them, kept in step across every session, with bars on a smooth color gradient, weather icons and reset countdowns.",
+  "author": {
+    "name": "Claude Code DevRel (Anthropic); modified by qarge"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/qarge/claude-mods/tree/main/mods/usage-weather"
+}

@@ -1,4 +1,4 @@
-# Token Weather
+# Usage Weather
 
 A Claude Code mod that draws a live forecast of your context window and your plan's usage limits in the band above the prompt. One hooks module, three rows, real figures wherever they exist: an estimate is shown only where no exact figure exists yet, and always marked `~`.
 
@@ -7,11 +7,11 @@ A Claude Code mod that draws a live forecast of your context window and your pla
 Three rows above the prompt, each with a weather icon, a bar, the percentage used and the details that matter:
 
 - **Context**: tokens used of the window, split into cached (read from the prompt cache) and uncached (plain input and cache writes), and how much is left before auto-compaction. It moves after every model request of a turn (each tool round), not only when the turn ends, and it always shows the chat on screen: after `/clear` or `/resume` it is that chat's figure, never the last one's.
-- **5-hour** and **Weekly**: your plan's usage limits as `/usage` reports them: percent used (rounded down, as `/usage` shows it), percent left, and a countdown to the reset with its local time.
+- **5-hour** and **Weekly**: your plan's usage limits as `/usage` reports them: percent used (rounded down, as `/usage` shows it), percent left, and a countdown to the reset with its local time. The limits are your account's, so every session on this computer shows the same figures: what any of them hears (its responses' rate-limit headers, its `/usage` reads) reaches the others within half a second.
 
 One scale for all three rows, by percent used:
 
-| Used      | Icon | Color         |
+| Used      | Icon | Color around  |
 |-----------|------|---------------|
 | under 25% | 🌞   | lighter green |
 | 25–49%    | ⛅   | green         |
@@ -20,7 +20,7 @@ One scale for all three rows, by percent used:
 | 90–99%    | 🌀   | red           |
 | 100% up   | ⛔   | darker red    |
 
-Green, amber and red are your theme's own. The lighter and darker shades are made from the colors of Claude Code's built-in dark and light themes; under any other theme (the colorblind-friendly and ANSI ones, for example) those levels keep the theme's own color. Each row's percentage takes its bar's color.
+Under Claude Code's built-in dark and light themes the color doesn't step from level to level: it glides with the percentage, through each level's color, placed inside its range (at 12.5%, 37.5%, 62.5%, 80%, 90% and 100%), and mixed in the OKLab color space in between, where equal steps look equal. No step of one point moves the color by more than about one just-noticeable difference (ΔE 0.018 in OKLab at most), so as a bar fills its color changes without a visible jump. Green, amber and red are the theme's own; the lighter green, darker orange and darker red are made from them. Under any other theme (the colorblind-friendly, ANSI and custom ones) each level keeps the theme's own color, as before. Each row's percentage takes its bar's color.
 
 For the context row the icon counts toward the auto-compaction point, where the window effectively ends; the percentage is of the whole window, as the status line and `/context` show it.
 
@@ -34,17 +34,18 @@ Where each figure comes from:
 | `~` context after `/compact` | the last exact figure, less the compacted messages, plus the messages that replace them, both counted with the token-count API (`POST /v1/messages/count_tokens`) | within a second of the compaction |
 | Window, auto-compaction point | `$.session.usage()`, with the summary breakdown, which is estimated locally and sends no request | at session start and when the model changes |
 | 5-hour and weekly limits at launch | the last reading any session kept in the mod's store (`$.store`), until `/usage` answers; a window that has reset since is left out | at once |
-| 5-hour and weekly limits | `GET /api/oauth/usage`, the endpoint `/usage` reads, sent with the session's own credential through `$.session.authorize()` (the mod never sees the token) | at session start, within 30 seconds of each turn's end, every 5 minutes when idle, and as soon as a window has reset |
+| 5-hour and weekly limits | `GET /api/oauth/usage`, the endpoint `/usage` reads, sent with the session's own credential through `$.session.authorize()` (the mod never sees the token) | at session start, within 30 seconds of each turn's end, a minute after the newest reading any session heard (checked every 30 seconds), and as soon as a window has reset |
 | | the rate-limit headers of each response, pushed by `session.measure` | during a turn, whenever a window moves a whole point |
+| | another session's readings: each session keeps the newest it has in the mod's store, a file every session on this computer reads, stamped with when it kept them | within half a second of any session hearing them |
 
 | Hook | What it does |
 |------|--------------|
-| `session.start` | Reads the window, the auto-compaction point and the starting estimate, starts a 30-second tick (countdowns, refreshes) and a half-second watch (which chat is on screen, and whether the engine has dropped its context figure or lowered it with no measure, as a rewind does), and draws the last kept limits reading while its `/usage` read runs alongside the engine's own start. |
+| `session.start` | Reads the window, the auto-compaction point and the starting estimate, starts a 30-second tick (countdowns, refreshes) and a half-second watch (which chat is on screen, and whether the engine has dropped its context figure or lowered it with no measure, as a rewind does), and draws the last kept limits reading while its `/usage` read runs alongside the engine's own start. The watch also reads the store, and takes the limits another session kept since. |
 | `session.end` | On `/clear` and `/resume`, drops the ending chat's figures at once: the process goes on into another chat with no `session.start`. |
 | `turn.step` | Reads each main-loop response's usage as it finishes. Subagents' requests have their own windows and are skipped. |
 | `session.compact` | Puts the context row right after a compaction of the main conversation, which no measurement follows. |
 | `turn.complete` | Marks the limits for a fresh `/usage` read on the next tick. |
-| `session.measure` | Takes the engine's pushed figures: context after a turn, limits when a window moves a point. |
+| `session.measure` | Takes the engine's pushed figures: context after a turn, limits when a window moves a point, which it keeps in the store for the other sessions. |
 | `ui.render` with `{component: "AbovePrompt"}` | Draws the three rows; one line when the band has fewer than three rows or under 50 columns. |
 
 ## Demo
@@ -71,7 +72,7 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
 
 ## How it was built
 
-- **Model:** built with Claude in Claude Code. Version 0.1.0 was tested with Claude Haiku 4.5. Versions 0.2.0 to 0.4.3 were built with Claude Opus 5.5 and tested live with Claude Haiku 5.5. The mod itself doesn't call a model.
+- **Model:** built with Claude in Claude Code. Version 0.1.0 was tested with Claude Haiku 4.5. Versions 0.2.0 to 0.5.0 were built with Claude Opus 5.5 and tested live with Claude Haiku 5.5. The mod itself doesn't call a model.
 - **Prompt(s):** the mod started as one of ten ideas Claude wrote for mods. This is the idea as written:
 
   > **Token Weather.** _A live forecast of your context window._ A band above the prompt draws a small chart of context use for each turn, as weather icons. It's clear when the window is mostly empty, and stormy when it's nearly full. It uses `ui.render` on the `AbovePrompt` component, with the `Svg` element, and it updates on `turn.complete`. I haven't confirmed which event or call gives the token counts, so that needs a check. Developers would share it because it looks good in a screenshot, and it answers "why did Claude forget that?" at a glance. The status line only shows text. _A weekend build._
@@ -91,6 +92,8 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
   Version 0.4.2 came from a request to have a code-review agent review the whole project, especially terminal rendering, initialization and cleanup, and to fix every confirmed problem.
 
   Version 0.4.3 came from a request to make the bar under 25% a lighter green than at 25–49%, the bar at 75–89% a darker orange than at 50–74%, and the bar at 100% a darker red.
+
+  Version 0.5.0 came from a request to fix the usage rows ignoring use from other sessions and moving only when Claude answered in the current one, to make the color transitions smooth enough to be virtually imperceptible, to close every test session automatically after testing, and to rename the mod everywhere: Token Weather became Usage Weather.
 - **Transcript:** not shared.
 - **Iterations:**
   - 0.1.0 read `$.session.usage()` once per turn, in `turn.complete`. 0.2.0 reads each response's usage in `turn.step`, so a long turn of tool calls moves the band request by request.
@@ -117,12 +120,15 @@ The limit rows show the last kept reading at once and `/usage`'s own within abou
     - A compaction's count went on to count another chat's messages after a `/resume`; it stops at the switch.
     - The band now redraws as soon as the start has read the window, unawaited work can't fail unhandled, kept readings are checked for values no window has, and 999,950 tokens read as `1M`, not `1000k`.
   - 0.4.3 was tested with `claude plugin test` (43 tests: the shades under the dark and light themes, the theme's own colors in between and under other themes, and a theme change in `/config`) and live: the terminal received the lighter green for a 4% context bar and the darker orange for limit bars at 80% and 88%.
+  - In 0.4.3 a session heard of its limits from its own responses' headers and its own `/usage` reads: after its turns, and every 5 minutes when idle. Use in another session reached it only through those 5-minute reads; what the other sessions heard went to the store, which a session read only at launch. 0.5.0 makes the store the sessions' common record: a probe with two `claude -p` processes showed that `$.store.get` reads the file each time, so another process's write is seen at once. Each session keeps every reading in it, stamped with when it kept them, and reads it every half second, taking any record stamped later than its own; it reads it again just before applying a reading of its own, so it adds to what another session kept rather than overwriting it. A `/usage` read is due a minute after the newest reading any session heard, so one read serves every session, however many are open. A session signed in with an API key takes none of the others' limits.
+  - 0.4.3 stepped from one color to the next at each level's edge, by 36 to 177 in one RGB channel. 0.5.0 places each level's color inside its range and mixes between them in OKLab. The anchors were spaced so that no one-point step changes the color by more than ΔE 0.018 in OKLab (0.015 under the light theme), about one just-noticeable difference; at the level midpoints the step from red to darker red was 0.034. Each anchor round-trips to its exact RGB value.
+  - 0.5.0 was tested with `claude plugin test` (48 tests; each new guard was broken on purpose to check that a test fails: the sync on the watch, the sync before a header is applied, the stamp, taking only newer records, the API-key guard, the one-minute refresh and the gradient), `tsc`, and live with two sessions side by side in pseudo-terminals. A record written to the store as another session would write it reached both bands in 0.43 seconds, and the terminal received the gradient's exact colors (`#76bc5e` at 41.5%, `#f79513` at 77%). After a turn in one session, that session's `/usage` read reached the other's band in 0.21 seconds, half a minute before its own read was due; the 5-hour row went from 16% to 17% in both. The test sessions ran with Remote Control off, so they never appeared in the Claude app, and were closed with `/exit` (then Ctrl-C, SIGTERM and SIGKILL if needed) whichever way the test ended; afterwards no test process or session entry was left.
 
 ## Run it
 
 **Requirements:**
 
-- Claude Code 2.1.296 or later (built and tested on 2.1.296).
+- Claude Code 2.1.296 or later (0.5.0 built and tested on 2.1.302).
 - A terminal (or the desktop app's Code tab): `AbovePrompt` is drawn on the terminal and desktop surfaces.
 - For the limit rows, a claude.ai subscription login (Pro, Max or Team). With an API key or a third-party provider the rows say they're unavailable; the context row works everywhere.
 
@@ -132,14 +138,14 @@ No environment variables or configuration.
 
 ```bash
 claude plugin marketplace add qarge/claude-mods
-claude plugin install token-weather@qarge-mods --scope user
+claude plugin install usage-weather@qarge-mods --scope user
 ```
 
 **Develop** from a clone of [qarge/claude-mods](https://github.com/qarge/claude-mods):
 
 ```bash
-claude --plugin-dir mods/token-weather   # one session, reloads on save
-scripts/check.sh token-weather           # validate, test, type-check
+claude --plugin-dir mods/usage-weather   # one session, reloads on save
+scripts/check.sh usage-weather           # validate, test, type-check
 ```
 
 ## Notes / limitations
@@ -149,12 +155,12 @@ scripts/check.sh token-weather           # validate, test, type-check
 - **"Cached" is what the API served from the prompt cache.** The cache is keyed on content, not on the chat, so a new chat's first response already reads its system prompt and tools from it.
 - **A resumed chat shows its last request's size**, as `/resume` reads it back, with no split until its next response. `/context` reads about 2k more there: it also estimates the last reply and what the resume attaches.
 - **Rewinding the conversation** isn't followed until the next response.
-- **Limits move during a turn only when the engine reports a whole-point move** from the response headers. Use from other sessions, devices or claude.ai shows after the next `/usage` read: after each turn, and every 5 minutes when idle.
+- **Limits move during a turn only when the engine reports a whole-point move** from the response headers. Use from another session on this computer shows as soon as any session hears of it (that session's headers or its `/usage` read after the turn). Use from other devices, claude.ai, or sessions without this mod shows after the next `/usage` read: after each turn, and within a minute and a half when idle.
 - **`/api/oauth/usage` is the endpoint Claude Code's own `/usage` reads, not a documented API**, and may change. If it does, the rows say they're unavailable and the header readings still fill them during turns.
 - **Only the 5-hour and the all-models weekly limit are shown.** `/usage`'s other rows (a Sonnet-only week, per-model weeks, usage credits) are not.
 - **A reading older than 15 minutes says how old it is**, for example when `/usage` can't be reached.
 - **A window `/usage` doesn't list shows as none open**, as `/usage` leaves it out too: a 5-hour window before the first use since its reset, for example.
-- **At launch the limit rows show the last kept reading** until `/usage` answers, about half a second. Use since then from another device or claude.ai shows when it does; a window that has reset since stays empty until then. The store isn't kept per account: after switching accounts the old account's reading shows for that half second.
+- **At launch the limit rows show the last kept reading** until `/usage` answers, about half a second. Use since then from another device or claude.ai shows when it does; a window that has reset since stays empty until then. The store isn't kept per account (Claude Code tells a mod the account only under an organization's managed login): after switching accounts the old account's reading shows for that half second, and two sessions signed in to different claude.ai accounts at once show whichever account was read last.
 - **One band per session.** Another plugin that draws `AbovePrompt` competes for the same band.
 
 ## Dependencies
@@ -165,6 +171,6 @@ scripts/check.sh token-weather           # validate, test, type-check
 
 ## Origin and license
 
-Derived from Token Weather by Anthropic's Claude Code DevRel team, in [anthropics/claude-code-playground](https://github.com/anthropics/claude-code-playground/tree/main/claude-code/mods/token-weather) (copyright 2026 Anthropic PBC). The upstream repository describes it as not an official Anthropic product, shared as-is; this version is changed by qarge and not made or endorsed by Anthropic. This README is adapted from the original's.
+Derived from Token Weather by Anthropic's Claude Code DevRel team (this mod kept that name until 0.5.0), in [anthropics/claude-code-playground](https://github.com/anthropics/claude-code-playground/tree/main/claude-code/mods/token-weather) (copyright 2026 Anthropic PBC). The upstream repository describes it as not an official Anthropic product, shared as-is; this version is changed by qarge and not made or endorsed by Anthropic. This README is adapted from the original's.
 
 Licensed under the Apache License, Version 2.0: see [LICENSE](LICENSE). [NOTICE](NOTICE) lists what was changed. Claude and Claude Code are trademarks of Anthropic, PBC.

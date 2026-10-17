@@ -1,4 +1,4 @@
-Token Weather
+Usage Weather
 Copyright 2026 Anthropic PBC
 Modifications copyright 2026 qarge
 
@@ -92,6 +92,30 @@ Changes by qarge, 2026-10-10 (version 0.4.3):
   orange and from 100% a darker red than the theme's own, for the dark and
   light themes (read from /config, and followed when it changes there).
 - .claude-plugin/plugin.json: version 0.4.3.
+- README.md and the tests describe and cover the above.
+
+Changes by qarge, 2026-10-17 (version 0.5.0):
+
+- The mod was renamed from Token Weather (token-weather) to Usage Weather
+  (usage-weather): the folder mods/token-weather is now mods/usage-weather,
+  hooks/token-weather.tsx is hooks/usage-weather.tsx, and
+  tests/token-weather.test.ts is tests/usage-weather.test.ts.
+- hooks/usage-weather.tsx:
+  - the limits are shared by every session on the computer: each keeps its
+    readings in the plugin's store, stamped with when it kept them, reads
+    the store every half second and takes a newer record, and reads it
+    again before applying a reading of its own;
+  - /usage is read again a minute after the newest reading any session
+    heard (was 5 minutes after this session's own), and an HTTP error with
+    no Retry-After still waits 5 minutes;
+  - a session with no claude.ai subscription login takes none of the other
+    sessions' limits;
+  - under the dark and light themes the bar color glides with the
+    percentage, mixed in OKLab through each level's color, in place of one
+    color per level.
+- hooks/hooks.json names the renamed module.
+- .claude-plugin/plugin.json: name usage-weather, version 0.5.0, a new
+  description and homepage.
 - README.md and the tests describe and cover the above.
 
 Every file in this folder is under the Apache License, Version 2.0 (see

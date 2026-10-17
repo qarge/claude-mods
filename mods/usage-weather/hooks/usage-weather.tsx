@@ -4,9 +4,10 @@
 //
 // Changed by qarge (2026-10-10) from hooks/token-weather.mjs of Token Weather
 // in anthropics/claude-code-playground: rewritten for live per-request
-// context and the plan's usage limits. See ../NOTICE for the changes.
+// context and the plan's usage limits, and renamed (2026-10-17). See
+// ../NOTICE for the changes.
 //
-// Token Weather: a live forecast of the context window and the plan's usage
+// Usage Weather: a live forecast of the context window and the plan's usage
 // limits, drawn above the prompt. Three rows (Context, 5-hour, Weekly), one
 // scale of weather icons for all of them.
 //
@@ -22,10 +23,14 @@
 // the session's credential handle ($.session.authorize: the token itself
 // never reaches this module). Fetched at start, after each turn (the headers
 // below are read as a request is answered, so they lag its own cost), and
-// whenever no reading is fresher than REFRESH_MS. While Claude works, every
-// response's rate-limit headers arrive through session.measure. The fetch
-// takes about half a second, so a session starts on the last reading any
-// session kept ($.store), and the fetch runs alongside the engine's start.
+// whenever no session has heard a reading fresher than REFRESH_MS. While
+// Claude works, every response's rate-limit headers arrive through
+// session.measure. The limits are the account's, so the sessions share them:
+// each keeps what it hears in $.store, a file every session reads, and takes
+// what the others kept every WATCH_MS. The rows follow use in any session at
+// once, and one /usage read serves them all. The fetch takes about half a
+// second, so a session starts on the last reading kept, and the fetch runs
+// alongside the engine's start.
 //
 // The host reads on(...) and $.noun.method(...) from source, so they are
 // spelled literally, and helpers that take $ are top-level functions.
@@ -35,13 +40,14 @@ import type { ApiMessage, EngineInterface, Register, SessionContextUsage, Timer 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const COUNT_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
 const TICK_MS = 30_000 // countdowns redraw, and stale limits are refetched
-const WATCH_MS = 500 // the session id and the engine's context figure are read this often
+const WATCH_MS = 500 // the session id, the engine's context figure and the kept limits are read this often
 const MIN_FETCH_MS = 30_000 // at most one /usage read this often
 const FETCH_GIVE_UP_MS = 60_000 // a /usage read unanswered this long is let go
 const COUNT_GIVE_UP_MS = 20_000 // a compaction's count past this gives way to the engine's estimate
-const REFRESH_MS = 5 * 60_000 // limits heard of longer ago than this are fetched again
+const REFRESH_MS = 60_000 // limits no session has heard of for this long are fetched again
+const BACKOFF_MS = 5 * 60_000 // after /usage refuses with no Retry-After
 const STALE_MS = 15 * 60_000 // past this a limit row says how old it is
-const STORE_KEY = 'limits' // the last readings, across sessions
+const STORE_KEY = 'limits' // the newest readings any session heard, and when they were kept
 const KINDS = ['five_hour', 'seven_day'] // the windows the rows show
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 
@@ -50,21 +56,26 @@ const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 // own one-cell ⚡ (JetBrains Mono, Nerd Fonts) otherwise draws that, left in
 // the two cells the icon takes.
 const SKY = [
-  { below: 25, icon: '🌞', color: 'success', shade: 0 },
+  { below: 25, icon: '🌞', color: 'success' },
   { below: 50, icon: '⛅\uFE0F', color: 'success' },
   { below: 75, icon: '☔\uFE0F', color: 'warning' },
-  { below: 90, icon: '⚡\uFE0F', color: 'warning', shade: 1 },
+  { below: 90, icon: '⚡\uFE0F', color: 'warning' },
   { below: 100, icon: '🌀', color: 'error' },
-  { below: Infinity, icon: '⛔\uFE0F', color: 'error', shade: 2 },
+  { below: Infinity, icon: '⛔\uFE0F', color: 'error' },
 ] as const
-// The shaded levels: a lighter green, a darker orange and a darker red than
-// the theme's own, made from the colours of the built-in dark and light
-// themes (dark: rgb(78,186,101), rgb(255,193,7), rgb(255,107,128); light:
-// rgb(44,122,57), rgb(150,108,30), rgb(171,43,63)). Any other theme keeps
-// its own colour at those levels.
-const SHADES: Record<string, readonly string[]> = {
-  dark: ['rgb(134,224,151)', 'rgb(245,140,20)', 'rgb(200,45,65)'],
-  light: ['rgb(96,176,108)', 'rgb(115,72,10)', 'rgb(125,20,40)'],
+// Under the built-in dark and light themes the colour glides with the
+// percentage instead of stepping at each level: through each level's colour,
+// placed inside its range, mixed in OKLab between them. The anchors are
+// spaced so that no step of one point moves the colour by more than about one
+// just-noticeable difference (ΔE 0.018 in OKLab at most). The level colours
+// are the theme's own green, amber and red (dark: rgb(78,186,101),
+// rgb(255,193,7), rgb(255,107,128); light: rgb(44,122,57), rgb(150,108,30),
+// rgb(171,43,63)), with a lighter green, a darker orange and a darker red made
+// from them. Any other theme keeps its own colour for each level.
+type Stop = readonly [percent: number, r: number, g: number, b: number]
+const GRADIENTS: Record<string, readonly Stop[]> = {
+  dark: [[12.5, 134, 224, 151], [37.5, 78, 186, 101], [62.5, 255, 193, 7], [80, 245, 140, 20], [90, 255, 107, 128], [100, 200, 45, 65]],
+  light: [[12.5, 96, 176, 108], [37.5, 44, 122, 57], [62.5, 150, 108, 30], [80, 115, 72, 10], [90, 171, 43, 63], [100, 125, 20, 40]],
 }
 type Sky = { icon: string; color?: string }
 const WAITING: Sky = { icon: '⏳\uFE0F' }
@@ -87,6 +98,8 @@ let ctx: {
   stale?: number // the engine's figure from before a compaction, until it lets go of it
 } = {}
 let limits: Record<string, Limit> = {}
+let keptAt = 0 // when the readings on hand were kept, by this session or another
+let isSignedOut = false // no claude.ai subscription login: no plan limits, nor the others'
 let limitsNote: string | undefined // why a limit row is empty, when it is
 let hasRead = false // /usage has answered: a window it leaves out has none open
 let fetchedAt = -Infinity
@@ -99,11 +112,14 @@ let watcher: Timer | undefined
 let isWatching = false
 let isCounting = false // a compaction's messages are being counted
 let heard: number | undefined // the engine's context figure, as last read
-let theme: string | undefined // the /config theme, which picks the shades
+let theme: string | undefined // the /config theme, which picks the gradient
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    limits = saved(await $.store.get(STORE_KEY).catch(() => undefined), await $.clock.now())
+    limits = {}
+    keptAt = 0
+    isSignedOut = false
+    await syncLimits($, true).catch(() => {})
     limitsNote = undefined
     hasRead = false
     fetchedAt = -Infinity
@@ -118,7 +134,10 @@ export const register: Register = on => {
     ticker?.cancel()
     ticker = $.clock.every(TICK_MS, () => void tick($).catch(() => {}))
     watcher?.cancel()
-    watcher = $.clock.every(WATCH_MS, () => void watch($))
+    watcher = $.clock.every(WATCH_MS, () => {
+      void watch($)
+      void syncLimits($).catch(() => {})
+    })
     return result
   })
 
@@ -146,13 +165,14 @@ export const register: Register = on => {
     // The rate limits ride along with every measure, as the last response
     // left them; they are news only when they moved.
     if (e.changed.includes('rateLimits')) {
+      await syncLimits($).catch(() => {}) // on top of what another session kept meanwhile
       const now = await $.clock.now()
       for (const limit of e.rateLimits) {
         if (KINDS.includes(limit.kind)) {
           setLimit(limit.kind, limit.percentUsed, timeOf(limit.resetsAt), now, true)
         }
       }
-      keepLimits($)
+      keepLimits($, now)
     }
     if (isNewWindow) {
       await readUsage($) // another model: its own compaction point
@@ -394,6 +414,8 @@ async function tick($: EngineInterface) {
   if (now < retryAt || now - fetchedAt < MIN_FETCH_MS) {
     return
   }
+  // The readings on hand are the newest any session heard: one read by
+  // another session lately spares this one its own.
   const readings = KINDS.flatMap(kind => limits[kind] ?? [])
   const lastHeard = Math.max(fetchedAt, ...readings.map(l => l.at))
   // Once: a reading taken after its own reset waits for the usual refresh.
@@ -417,6 +439,7 @@ async function fetchLimits($: EngineInterface) {
     if (gen !== fetchGen) {
       return
     }
+    isSignedOut = auth?.kind !== 'bearer'
     if (auth?.kind !== 'bearer') {
       // An API key, a gateway or a third-party provider: no plan limits, until
       // a /login (asked again with each refresh).
@@ -434,11 +457,13 @@ async function fetchLimits($: EngineInterface) {
     }
     if (!response.ok) {
       const seconds = Number(response.headers['retry-after'])
-      retryAt = now + (seconds > 0 ? seconds * 1000 : response.status >= 500 ? 2 * 60_000 : REFRESH_MS)
+      retryAt = now + (seconds > 0 ? seconds * 1000 : response.status >= 500 ? 2 * 60_000 : BACKOFF_MS)
       limitsNote = `/usage answered HTTP ${response.status}`
       return
     }
     const data: unknown = JSON.parse(response.text)
+    await syncLimits($).catch(() => {}) // on top of what another session kept meanwhile
+    const answeredAt = await $.clock.now()
     let hasAny = false
     for (const kind of KINDS) {
       const window = (data as Record<string, { utilization?: unknown; resets_at?: unknown } | null>)?.[kind]
@@ -452,7 +477,7 @@ async function fetchLimits($: EngineInterface) {
     limitsNote = hasAny ? undefined : 'no 5-hour or weekly limit on this plan'
     hasRead = true
     retryAt = 0
-    keepLimits($)
+    keepLimits($, answeredAt)
   } catch {
     if (gen === fetchGen) {
       retryAt = now + 2 * 60_000
@@ -493,19 +518,43 @@ function setLimit(kind: string, used: number, resetsAt: number | undefined, now:
   limits[kind] = { used, resetsAt, at: now }
 }
 
-// The readings for the next session's first frame, whichever session made them last.
-function keepLimits($: EngineInterface) {
-  $.store.set(STORE_KEY, limits).catch(() => {})
+// The readings for the other sessions, and for the next session's first
+// frame, stamped `now` (the time they were applied) or later than any kept
+// so far, so every session takes them. Nothing is awaited before the store
+// has them: a sync in between would put the readings on hand back.
+function keepLimits($: EngineInterface, now: number) {
+  keptAt = Math.max(now, keptAt + 1)
+  $.store.set(STORE_KEY, { ...limits, at: keptAt }).catch(() => {})
 }
 
-// A kept reading, less what can't stand: a window that has reset since, or a
-// value no reading has.
-function saved(value: unknown, now: number) {
+// Every WATCH_MS, and before this session applies a reading of its own: the
+// readings another session kept since, which are the newest any session has.
+// Each session stamps the readings it keeps, so the newest stamp is everyone's.
+async function syncLimits($: EngineInterface, isLaunch = false) {
+  if (isSignedOut) {
+    return // another login's limits are not this session's
+  }
+  const value = await $.store.get(STORE_KEY)
+  const now = await $.clock.now()
+  const at = (value as { at?: unknown } | undefined)?.at
+  const stamp = typeof at === 'number' ? at : 0
+  if (stamp <= keptAt && !isLaunch) {
+    return
+  }
+  keptAt = stamp
+  limits = saved(value, now, isLaunch)
+  $.ui.invalidate('ui.render')
+}
+
+// A kept reading, less what can't stand: a value no reading has, or, at
+// launch, a window that may have reset since.
+function saved(value: unknown, now: number, isLaunch: boolean) {
   const kept: Record<string, Limit> = {}
   for (const kind of KINDS) {
     const l = (value as Record<string, Partial<Limit> | null> | undefined)?.[kind]
-    if (typeof l?.used === 'number' && l.used >= 0 && l.used < 1000 && typeof l.at === 'number' && l.at <= now && typeof l.resetsAt === 'number' && l.resetsAt > now) {
-      kept[kind] = { used: l.used, resetsAt: l.resetsAt, at: l.at }
+    const resetsAt = typeof l?.resetsAt === 'number' ? l.resetsAt : undefined
+    if (typeof l?.used === 'number' && l.used >= 0 && l.used < 1000 && typeof l.at === 'number' && l.at <= now && (!isLaunch || (resetsAt ?? 0) > now)) {
+      kept[kind] = { used: l.used, resetsAt, at: l.at }
     }
   }
   return kept
@@ -588,8 +637,40 @@ function limitRow(label: string, limit: Limit | undefined, now: number, columns:
 
 function skyFor(percent: number): Sky {
   const sky = SKY.find(s => percent < s.below) ?? SKY[SKY.length - 1]!
-  const shade = 'shade' in sky && theme !== undefined ? SHADES[theme]?.[sky.shade] : undefined
-  return { icon: sky.icon, color: shade ?? sky.color }
+  const stops = theme !== undefined && Object.hasOwn(GRADIENTS, theme) ? GRADIENTS[theme] : undefined
+  return { icon: sky.icon, color: stops ? glide(stops, percent) : sky.color }
+}
+
+// The colour at `percent`: between the two stops around it, mixed in OKLab;
+// below the first stop and from the last, that stop's own.
+function glide(stops: readonly Stop[], percent: number) {
+  const i = stops.findIndex(s => percent < s[0])
+  const hi = stops[i === -1 ? stops.length - 1 : i]!
+  const lo = i > 0 ? stops[i - 1]! : hi
+  const t = lo === hi ? 0 : (percent - lo[0]) / (hi[0] - lo[0])
+  const a = oklab(lo.slice(1))
+  const b = oklab(hi.slice(1))
+  return `rgb(${srgb(a.map((v, k) => v + (b[k]! - v) * t)).join(',')})`
+}
+
+// sRGB to OKLab and back, with Björn Ottosson's matrices (bottosson.github.io/posts/oklab).
+const TO_LMS = [[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566], [0.0883024619, 0.2817188376, 0.6299787005]]
+const TO_LAB = [[0.2104542553, 0.793617785, -0.0040720468], [1.9779984951, -2.428592205, 0.4505937099], [0.0259040371, 0.7827717662, -0.808675766]]
+const FROM_LAB = [[1, 0.3963377774, 0.2158037573], [1, -0.1055613458, -0.0638541728], [1, -0.0894841775, -1.291485548]]
+const FROM_LMS = [[4.0767416621, -3.3077115913, 0.2309699292], [-1.2684380046, 2.6097574011, -0.3413193965], [-0.0041960863, -0.7034186147, 1.707614701]]
+
+function times(m: number[][], v: readonly number[]) {
+  return m.map(row => row[0]! * v[0]! + row[1]! * v[1]! + row[2]! * v[2]!)
+}
+
+function oklab(rgb: readonly number[]) {
+  const linear = rgb.map(c => c / 255).map(c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4))
+  return times(TO_LAB, times(TO_LMS, linear).map(Math.cbrt))
+}
+
+function srgb(lab: readonly number[]) {
+  const linear = times(FROM_LMS, times(FROM_LAB, lab).map(c => c ** 3))
+  return linear.map(c => Math.round(255 * Math.min(1, Math.max(0, c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055))))
 }
 
 // The filled part of a bar `width` cells wide, to an eighth of a cell.

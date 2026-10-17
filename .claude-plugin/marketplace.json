@@ -8,9 +8,9 @@
   },
   "plugins": [
     {
-      "name": "token-weather",
-      "source": "./mods/token-weather",
-      "description": "A live forecast above the prompt: context window fill (cached and uncached) on every model request, and the 5-hour and weekly usage limits as /usage reports them."
+      "name": "usage-weather",
+      "source": "./mods/usage-weather",
+      "description": "A live forecast above the prompt: context window fill (cached and uncached) on every model request, and the 5-hour and weekly usage limits as /usage reports them, in step across every session."
     }
   ]
 }

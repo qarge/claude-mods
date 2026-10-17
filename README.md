@@ -6,7 +6,7 @@ Mods for [Claude Code](https://code.claude.com): plugins that change what Claude
 
 | Mod | What it does | License |
 | --- | --- | --- |
-| [`token-weather`](mods/token-weather/) | A live forecast above the prompt: context window fill (cached and uncached) updated on every model request, and the 5-hour and weekly usage limits as `/usage` reports them. | Apache-2.0, derived from Anthropic's [claude-code-playground](https://github.com/anthropics/claude-code-playground) |
+| [`usage-weather`](mods/usage-weather/) | A live forecast above the prompt: context window fill (cached and uncached) updated on every model request, and the 5-hour and weekly usage limits as `/usage` reports them, in step across every session, on a smooth color gradient. | Apache-2.0, derived from Anthropic's [claude-code-playground](https://github.com/anthropics/claude-code-playground) |
 
 ## Install
 
@@ -14,10 +14,10 @@ From a shell:
 
 ```bash
 claude plugin marketplace add qarge/claude-mods
-claude plugin install token-weather@qarge-mods --scope user
+claude plugin install usage-weather@qarge-mods --scope user
 ```
 
-Or inside Claude Code: `/plugin marketplace add qarge/claude-mods`, then `/plugin install token-weather@qarge-mods`. The user scope loads a mod in every session from then on. To update an installed mod: `claude plugin marketplace update qarge-mods`, then `claude plugin update token-weather@qarge-mods`, then restart Claude Code.
+Or inside Claude Code: `/plugin marketplace add qarge/claude-mods`, then `/plugin install usage-weather@qarge-mods`. The user scope loads a mod in every session from then on. To update an installed mod: `claude plugin marketplace update qarge-mods`, then `claude plugin update usage-weather@qarge-mods`, then restart Claude Code.
 
 The mods use Claude Code's mod API, which is early access and changes between releases. Each mod's README names the Claude Code version it was built and tested on.
 
@@ -89,6 +89,6 @@ Claude Code runs an installed copy of the mod, not the folder: after a change, b
 
 Everything in this repository is under the [MIT License](LICENSE), copyright qarge, except where a mod's folder says otherwise. A mod derived from someone else's work keeps that work's license, copyright and notices in its folder, and its NOTICE file says what was changed:
 
-- [`mods/token-weather`](mods/token-weather/) is under the Apache License 2.0. It is derived from Token Weather by Anthropic's Claude Code DevRel team (copyright 2026 Anthropic PBC). See its [NOTICE](mods/token-weather/NOTICE) and [LICENSE](mods/token-weather/LICENSE).
+- [`mods/usage-weather`](mods/usage-weather/) is under the Apache License 2.0. It is derived from Token Weather by Anthropic's Claude Code DevRel team (copyright 2026 Anthropic PBC). See its [NOTICE](mods/usage-weather/NOTICE) and [LICENSE](mods/usage-weather/LICENSE).
 
 This project is not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC; they are named here only to say what the mods work with.
